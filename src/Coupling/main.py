@@ -21,6 +21,7 @@ class Main():
     # add your arguments by defining keys and default values in the dictionary below
     arguments = {
         "Mode": ["1D", "2D"],
+        "Maximum deviation": 25,
         "NanoTrak vertical position": (),
         "NanoTrak horizontal position": (),
         "NanoTrak Reading": (),
@@ -43,6 +44,8 @@ class Main():
         self.original_vertical_position: float = 5.0
         self.original_horizontal_position: float = 5.0
 
+        self.maximum_deviation: float = 25.0  # maximum allowed deviation of Gauss maximum for successful coupling
+
     def configure(self) -> None:
         """Create the 1D or 2D array of positions."""
         self.horizontal_positions = np.linspace(0, 10, self.scan_range)
@@ -60,6 +63,7 @@ class Main():
     def main(self, **kwargs) -> tuple:
         """Create an array of values according to the provided arguments."""
         self.mode = kwargs["Mode"]
+        self.maximum_deviation = float(kwargs["Maximum deviation"])
         reading = kwargs["NanoTrak Reading"]
         operating = True
         passed = False
@@ -127,28 +131,32 @@ class Main():
 
         Returns True if coupling is successful, False otherwise.
         """
-        # Fit 1D data
+        power = self.convert_voltage_to_dbm(self.power_array)
+        # Ensure flat 1D array for curve fitting
+        power = np.asarray(power).ravel()
+
         try:
-            power = self.convert_voltage_to_dbm(self.power_array)
             # popt = Optimal parameters for the function, pcov = Covariance of the parameters
-            popt, pcov = curve_fit(f=self.gaussian,
-                                   xdata=self.position_array,
-                                   ydata=power,
-                                   p0=[0.01, 5, 4]
-                                   )
+            popt, pcov = curve_fit(
+                f=self.gaussian,
+                xdata=self.vertical_positions,
+                ydata=power,
+                p0=[0.01, 5, 4],
+            )
 
-            # TODO: why? - get min and max
-            # x_fine = np.arange(0, 10.5, 0.25)
-            # self.fitted_power_array = self.gaus(x_fine, *popt)
-            # self.fitted_power_array = np.array(self.fitted_power_array)
-
-            # TODO: retrieve gaus_min and gaus_max from parent class of looptool?
-            if self.gaus_min < abs(popt[2]) < self.gaus_max:
-                return True
-            else:
-                return False
         except Exception as e:
             return False
+
+        if self.fit_is_valid(abs(popt[2])):
+            return True
+
+        return False
+
+    @staticmethod
+    def convert_voltage_to_dbm(voltage: float | np.ndarray) -> float | np.ndarray:
+        """Convert voltage reading to dBm."""
+        step = ((voltage - 3.5) * 22.17647059) - 20.1
+        return 10**(step/10)  # ???
 
     @staticmethod
     def gaussian(x: np.ndarray, a: float, x0: float, sigma: float) -> np.ndarray:
@@ -162,11 +170,9 @@ class Main():
         """
         return a * np.exp(-(x - x0) ** 2 / (2 * sigma ** 2))
 
-    @staticmethod
-    def convert_voltage_to_dbm(voltage: float | np.ndarray) -> float | np.ndarray:
-        """Convert voltage reading to dBm."""
-        step = ((voltage - 3.5) * 22.17647059) - 20.1
-        return 10**(step/10)  # ???
+    def fit_is_valid(self, position: float) -> bool:
+        """Check if the fitted Gauss maximum is within the maximum deviation."""
+        return 100 - self.maximum_deviation <= position <= 100 + self.maximum_deviation
 
     def analyze_2d_power_array(self) -> bool:
         """Fit the 2D power array to find the best coupling position.
@@ -174,18 +180,32 @@ class Main():
         Returns True if coupling is successful, False otherwise.
         """
         power_linear = self.convert_voltage_to_dbm(self.power_array)
-        initial_guess = [np.max(power_linear), np.mean(self.horizontal_positions), np.mean(self.vertical_positions), 3, 3, 0,
-                         np.min(power_linear)]
+        power_linear = np.asarray(power_linear).ravel()
+
+        initial_guess = [
+            np.max(power_linear),
+            np.mean(self.horizontal_positions),
+            np.mean(self.vertical_positions),
+            3,
+            3,
+            0,
+            np.min(power_linear)
+        ]
         xy_array = np.column_stack((self.horizontal_positions, self.vertical_positions))
         try:
-            popt, pcov = curve_fit(self.gaus_2d, xy_array, power_linear.ravel(), p0=initial_guess)
-            if self.gaus_min < popt[1] < self.gaus_max and self.gaus_min < popt[2] < self.gaus_max:
-                return True
-            else:
-                return False
-
+            popt, pcov = curve_fit(
+                self.gaus_2d,
+                xy_array,
+                power_linear,
+                p0=initial_guess,
+            )
         except Exception as e:
             return False
+
+        if self.fit_is_valid(popt[1]) and self.fit_is_valid(popt[2]):
+                return True
+
+        return False
 
     @staticmethod
     def gaus_2d(XY, amplitude, xo, yo, sigma_x, sigma_y, theta, offset) -> np.ndarray:
@@ -199,8 +219,3 @@ class Main():
 
         g = offset + amplitude * np.exp(- (a * ((x - xo) ** 2) + 2 * b * (x - xo) * (y - yo) + c * ((y - yo) ** 2)))
         return g.ravel()
-
-
-
-
-
