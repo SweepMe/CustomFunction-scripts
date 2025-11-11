@@ -16,14 +16,14 @@ class Main():
     """
 
     # please define variables and units as returned by the function 'main'
-    variables = ["Vertical Position", "Horizontal Position", "Operating", "Passed"]
+    variables = ["Horizontal Position", "Vertical Position", "Operating", "Passed"]
     units = ["NT", "NT", "", ""]
     # add your arguments by defining keys and default values in the dictionary below
     arguments = {
         "Mode": ["1D", "2D"],
         "Maximum deviation": 25,
-        "NanoTrak vertical position": (),
         "NanoTrak horizontal position": (),
+        "NanoTrak vertical position": (),
         "NanoTrak Reading": (),
     }
     execution = "process"  # Handle the NanoTrak reading after each measurement point
@@ -74,6 +74,7 @@ class Main():
                 # TODO: check if float conversion is necessary
                 self.original_vertical_position = float(kwargs["NanoTrak vertical position"])
                 self.original_horizontal_position = float(kwargs["NanoTrak horizontal position"])
+                print(f"First CFS call, saving original positions to {self.original_vertical_position} and {self.original_horizontal_position}.")
 
             else:
                 # All other calls, save reading at last position
