@@ -6,6 +6,15 @@ from __future__ import annotations
 
 import numpy as np
 from scipy.optimize import curve_fit
+from enum import Enum
+
+
+class Phase(Enum):
+    """Enum for the different phases of the coupling confirmation process."""
+
+    INITIALIZE = 1
+    SCANNING = 2
+    FINALIZE = 3
 
 
 class Main():
@@ -13,6 +22,7 @@ class Main():
     <h2>Confirm coupling</h2>
     
     Perform a 1D or 2D scan over positions and find the best coupling position.
+    Intensity must be provided in linear scale, not in dBm.
     """
 
     # please define variables and units as returned by the function 'main'
@@ -24,7 +34,7 @@ class Main():
         "Maximum deviation": 25,
         "NanoTrak horizontal position": (),
         "NanoTrak vertical position": (),
-        "NanoTrak Reading": (),
+        "Intensity": (),
     }
     execution = "process"  # Handle the NanoTrak reading after each measurement point
 
@@ -46,9 +56,12 @@ class Main():
 
         self.maximum_deviation: float = 25.0  # maximum allowed deviation of Gauss maximum for successful coupling
 
+        self.phase: Phase = Phase.INITIALIZE
+
     def configure(self) -> None:
         """Create the 1D or 2D array of positions."""
         self.horizontal_positions = np.linspace(0, 10, self.scan_range)
+        self.phase = Phase.INITIALIZE
 
         if self.mode == "1D":
             self.power_array = np.zeros(self.scan_range)
@@ -64,83 +77,115 @@ class Main():
         """Create an array of values according to the provided arguments."""
         self.mode = kwargs["Mode"]
         self.maximum_deviation = float(kwargs["Maximum deviation"])
-        reading = kwargs["NanoTrak Reading"]
+        intensity = kwargs["Intensity"]
         operating = True
         passed = False
 
         if self.mode == "1D":
-            if self.last_position_index < 0:
-                # First call, save first home position, do not save reading yet
-                # TODO: check if float conversion is necessary
+            # First call: save originals, switch to SCANNING and return first scan position
+            if self.phase == Phase.INITIALIZE:
                 self.original_vertical_position = float(kwargs["NanoTrak vertical position"])
                 self.original_horizontal_position = float(kwargs["NanoTrak horizontal position"])
                 print(f"First CFS call, saving original positions to {self.original_vertical_position} and {self.original_horizontal_position}.")
 
-            else:
-                # All other calls, save reading at last position
-                self.power_array[self.last_position_index] = reading
+                self.phase = Phase.SCANNING
+                self.last_position_index = 0
+                next_horizontal_position = self.horizontal_positions[0]
+                next_vertical_position = self.original_vertical_position
 
-            next_position_index = self.last_position_index + 1
+            # SCANNING: save intensity for the last returned position, then return next position
+            elif self.phase == Phase.SCANNING:
+                # save intensity measured at the previous position (if any)
+                if isinstance(self.last_position_index, int) and self.last_position_index >= 0:
+                    self.power_array[self.last_position_index] = intensity
 
-            if next_position_index >= self.scan_range - 1:
+                # if we just saved the last scan index, return home and prepare FINALIZE
+                if self.last_position_index >= self.scan_range - 1:
+                    self.phase = Phase.FINALIZE
+                    next_horizontal_position = self.original_horizontal_position
+                    next_vertical_position = self.original_vertical_position
+                    # mark to avoid writing into power_array on the finalize call
+                    self.last_position_index = -1
+                else:
+                    # advance to next scan index and return that position
+                    self.last_position_index += 1
+                    next_horizontal_position = self.horizontal_positions[self.last_position_index]
+                    next_vertical_position = self.original_vertical_position
+
+            # FINALIZE: run analysis and return passed with operating=False
+            elif self.phase == Phase.FINALIZE:
                 passed = self.analyze_1d_power_array()
                 operating = False
+                self.phase = Phase.INITIALIZE
                 self.last_position_index = -1
-                next_vertical_position = self.original_vertical_position
+                # return original position (instrument should be at original already)
                 next_horizontal_position = self.original_horizontal_position
-            else:
-                self.last_position_index = next_position_index
-                next_horizontal_position = self.horizontal_positions[next_position_index]
                 next_vertical_position = self.original_vertical_position
 
         elif self.mode == "2D":
-            row, col = self.last_position_index
-            if (row, col) == (-1, -1):
-                # First call, save first home position, do not save reading yet
+            # INITIALIZE: save originals, start scanning, return first scan position
+            if self.phase == Phase.INITIALIZE:
                 self.original_vertical_position = float(kwargs["NanoTrak vertical position"])
                 self.original_horizontal_position = float(kwargs["NanoTrak horizontal position"])
-            else:
-                # All other calls, save reading at last position
-                self.power_array[row, col] = reading
+                self.phase = Phase.SCANNING
+                self.last_position_index = (0, 0)
+                next_vertical_position = self.vertical_positions[0]
+                next_horizontal_position = self.horizontal_positions[0]
 
-            # increase index
-            if col < self.scan_range - 1:
-                next_position_index = (row, col + 1)
-            else:
-                next_position_index = (row + 1, 0)
+            # SCANNING: save intensity for last returned position, then return next position
+            elif self.phase == Phase.SCANNING:
+                row, col = self.last_position_index
+                # save intensity measured at the previous position (if any)
+                if isinstance(row, int) and isinstance(col, int) and row >= 0 and col >= 0:
+                    self.power_array[row, col] = intensity
 
-            if row >= self.scan_range:
-                # finished
-                operating = False
+                # if we just saved the last scan index, return home and prepare FINALIZE
+                if row == self.scan_range - 1 and col == self.scan_range - 1:
+                    self.phase = Phase.FINALIZE
+                    next_vertical_position = self.original_vertical_position
+                    next_horizontal_position = self.original_horizontal_position
+                    # mark to avoid writing into power_array on the finalize call
+                    self.last_position_index = (-1, -1)
+                else:
+                    # advance to next scan index and return that position
+                    if col < self.scan_range - 1:
+                        next_index = (row, col + 1)
+                    else:
+                        next_index = (row + 1, 0)
+                    self.last_position_index = next_index
+                    next_vertical_position = self.vertical_positions[next_index[0]]
+                    next_horizontal_position = self.horizontal_positions[next_index[1]]
+
+            # FINALIZE: run analysis and return passed with operating=False
+            elif self.phase == Phase.FINALIZE:
                 passed = self.analyze_2d_power_array()
+                operating = False
+                self.phase = Phase.INITIALIZE
                 self.last_position_index = (-1, -1)
+                # return original position (instrument should be at original already)
                 next_vertical_position = self.original_vertical_position
                 next_horizontal_position = self.original_horizontal_position
-            else:
-                self.last_position_index = next_position_index
-                next_vertical_position = self.vertical_positions[next_position_index[0]]
-                next_horizontal_position = self.horizontal_positions[next_position_index[1]]
 
         else:
             msg = f"Invalid mode: {self.mode}. Use '1D' or '2D'."
             raise ValueError(msg)
 
-        return next_vertical_position, next_horizontal_position, operating, passed
+        return next_horizontal_position, next_vertical_position, operating, passed
 
     def analyze_1d_power_array(self) -> bool:
         """Fit the 1D power array to find the best coupling position.
 
         Returns True if coupling is successful, False otherwise.
         """
-        power = self.convert_voltage_to_dbm(self.power_array)
+        # power = self.convert_voltage_to_dbm(self.power_array)
         # Ensure flat 1D array for curve fitting
-        power = np.asarray(power).ravel()
+        power = np.asarray(self.power_array).ravel()
 
         try:
             # popt = Optimal parameters for the function, pcov = Covariance of the parameters
             popt, pcov = curve_fit(
                 f=self.gaussian,
-                xdata=self.vertical_positions,
+                xdata=self.horizontal_positions,
                 ydata=power,
                 p0=[0.01, 5, 4],
             )
@@ -148,10 +193,7 @@ class Main():
         except Exception as e:
             return False
 
-        if self.fit_is_valid(abs(popt[2])):
-            return True
-
-        return False
+        return self.fit_is_valid(abs(popt[2]))
 
     @staticmethod
     def convert_voltage_to_dbm(voltage: float | np.ndarray) -> float | np.ndarray:
@@ -180,8 +222,8 @@ class Main():
 
         Returns True if coupling is successful, False otherwise.
         """
-        power_linear = self.convert_voltage_to_dbm(self.power_array)
-        power_linear = np.asarray(power_linear).ravel()
+        # power_linear = self.convert_voltage_to_dbm(self.power_array)
+        power_linear = np.asarray(self.power_array).ravel()
 
         initial_guess = [
             np.max(power_linear),
@@ -203,10 +245,7 @@ class Main():
         except Exception as e:
             return False
 
-        if self.fit_is_valid(popt[1]) and self.fit_is_valid(popt[2]):
-                return True
-
-        return False
+        return self.fit_is_valid(popt[1]) and self.fit_is_valid(popt[2])
 
     @staticmethod
     def gaus_2d(XY, amplitude, xo, yo, sigma_x, sigma_y, theta, offset) -> np.ndarray:
