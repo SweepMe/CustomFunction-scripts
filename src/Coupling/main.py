@@ -31,6 +31,8 @@ class Main():
     # add your arguments by defining keys and default values in the dictionary below
     arguments = {
         "Mode": ["1D", "2D"],
+        "Input spot size": 10,
+        "Output spot size": 10,
         "Maximum deviation": 25,
         "NanoTrak horizontal position": (),
         "NanoTrak vertical position": (),
@@ -54,7 +56,10 @@ class Main():
         self.original_vertical_position: float = 5.0
         self.original_horizontal_position: float = 5.0
 
+        # Pass/Fail criteria
         self.maximum_deviation: float = 25.0  # maximum allowed deviation of Gauss maximum for successful coupling
+        self.input_spot_size: float = 10.0  # in microns
+        self.output_spot_size: float = 10.0  # in microns
 
         self.phase: Phase = Phase.INITIALIZE
 
@@ -77,6 +82,8 @@ class Main():
         """Create an array of values according to the provided arguments."""
         self.mode = kwargs["Mode"]
         self.maximum_deviation = float(kwargs["Maximum deviation"])
+        self.input_spot_size = float(kwargs["Input spot size"])
+        self.output_spot_size = float(kwargs["Output spot size"])
         intensity = kwargs["Intensity"]
         operating = True
         passed = False
@@ -213,9 +220,12 @@ class Main():
         """
         return a * np.exp(-(x - x0) ** 2 / (2 * sigma ** 2))
 
-    def fit_is_valid(self, position: float) -> bool:
-        """Check if the fitted Gauss maximum is within the maximum deviation."""
-        return 100 - self.maximum_deviation <= position <= 100 + self.maximum_deviation
+    def fit_is_valid(self, sigma: float) -> bool:
+        """Check if the fitted Gauss width is within the maximum deviation."""
+        sigma_conv = self.calculate_gaussian_width(self.input_spot_size, self.output_spot_size)
+        sigma_min = sigma_conv * (1 - self.maximum_deviation / 100)
+        sigma_max = sigma_conv * (1 + self.maximum_deviation / 100)
+        return sigma_min <= sigma <= sigma_max
 
     def analyze_2d_power_array(self) -> bool:
         """Fit the 2D power array to find the best coupling position.
@@ -259,3 +269,43 @@ class Main():
 
         g = offset + amplitude * np.exp(- (a * ((x - xo) ** 2) + 2 * b * (x - xo) * (y - yo) + c * ((y - yo) ** 2)))
         return g.ravel()
+
+    def calculate_gaussian_width(self, input_spot_size: float, output_spot_size: float) -> tuple:
+        """
+        Calculates the effective Gaussian width (MFD) of the convolution between
+        the input and output modes, assuming both profiles are Gaussian.
+
+        Assumptions:
+            1. Both the input and the output mode fields have a Gaussian intensity profile.
+            2. 1D case.
+            3. Strongly guided waveguide approximation.
+
+        Returns the sigma
+        """
+        def conversion(width: float) -> float:
+            """Convert width to sigma (standard deviation) for Gaussian function."""
+            return width / 4.0
+
+        sigma_input = conversion(input_spot_size)
+        sigma_output = conversion(output_spot_size)
+
+        # Calculate Gaussian profile for input and output
+        x = np.linspace(0, 20, 1000)
+        gauss_center = 10
+        input_gaus = self.gaussian(x, 1, gauss_center, sigma_input)
+        output_gaus = self.gaussian(x, 1, gauss_center, sigma_output)
+
+        # Convolution of input and output Gaussian profiles
+        conv_gaus = np.convolve(input_gaus, output_gaus, mode="same")
+        conv_gaus /= np.max(conv_gaus)
+        conv_gaus = conv_gaus ** 2
+
+        # Fit the convolved Gaussian to extract the effective sigma
+        popt, _ = curve_fit(
+            self.gaussian,
+            x,
+            conv_gaus,
+            p0=[1, gauss_center, np.sqrt(sigma_input**2 + sigma_output**2)]
+        )
+        sigma_conv = abs(popt[2])
+        return sigma_conv
