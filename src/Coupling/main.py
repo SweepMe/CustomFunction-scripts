@@ -31,9 +31,9 @@ class Main():
     # add your arguments by defining keys and default values in the dictionary below
     arguments = {
         "Mode": ["1D", "2D"],
-        "Input spot size": 10,
-        "Output spot size": 10,
-        "Maximum deviation": 25,
+        "Input spot size": 10.,
+        "Output spot size": 10.,
+        "Maximum deviation": 25.,
         "NanoTrak horizontal position": (),
         "NanoTrak vertical position": (),
         "Intensity": (),
@@ -60,23 +60,14 @@ class Main():
         self.maximum_deviation: float = 25.0  # maximum allowed deviation of Gauss maximum for successful coupling
         self.input_spot_size: float = 10.0  # in microns
         self.output_spot_size: float = 10.0  # in microns
+        self.sigma_min: float = 0.0
+        self.sigma_max: float = 0.0
 
         self.phase: Phase = Phase.INITIALIZE
 
     def configure(self) -> None:
-        """Create the 1D or 2D array of positions."""
-        self.horizontal_positions = np.linspace(0, 10, self.scan_range)
+        """Reset the phase to INITIALIZE."""
         self.phase = Phase.INITIALIZE
-
-        if self.mode == "1D":
-            self.power_array = np.zeros(self.scan_range)
-            self.vertical_positions = np.array([0.0])
-            self.last_position_index = -1
-
-        elif self.mode == "2D":
-            self.power_array = np.zeros((self.scan_range, self.scan_range))
-            self.vertical_positions = np.linspace(0, 10, self.scan_range)
-            self.last_position_index = (-1, -1)
 
     def main(self, **kwargs) -> tuple:
         """Create an array of values according to the provided arguments."""
@@ -89,13 +80,13 @@ class Main():
         passed = False
 
         if self.mode == "1D":
-            # First call: save originals, switch to SCANNING and return first scan position
+            # First call: save originals, create power and position arrays, switch to SCANNING and return first scan position
             if self.phase == Phase.INITIALIZE:
-                self.original_vertical_position = float(kwargs["NanoTrak vertical position"])
-                self.original_horizontal_position = float(kwargs["NanoTrak horizontal position"])
-                print(f"First CFS call, saving original positions to {self.original_vertical_position} and {self.original_horizontal_position}.")
+                self.save_original_positions(kwargs)
+                self.initialize_position_and_power_arrays(self.mode)
 
                 self.phase = Phase.SCANNING
+
                 self.last_position_index = 0
                 next_horizontal_position = self.horizontal_positions[0]
                 next_vertical_position = self.original_vertical_position
@@ -130,10 +121,11 @@ class Main():
                 next_vertical_position = self.original_vertical_position
 
         elif self.mode == "2D":
-            # INITIALIZE: save originals, start scanning, return first scan position
+            # First call: save originals, create power and position arrays, switch to SCANNING and return first scan position
             if self.phase == Phase.INITIALIZE:
-                self.original_vertical_position = float(kwargs["NanoTrak vertical position"])
-                self.original_horizontal_position = float(kwargs["NanoTrak horizontal position"])
+                self.save_original_positions(kwargs)
+                self.initialize_position_and_power_arrays(self.mode)
+
                 self.phase = Phase.SCANNING
                 self.last_position_index = (0, 0)
                 next_vertical_position = self.vertical_positions[0]
@@ -179,22 +171,49 @@ class Main():
 
         return next_horizontal_position, next_vertical_position, operating, passed
 
+    def save_original_positions(self, kwargs) -> None:
+        """Save the original NanoTrak positions."""
+        self.original_vertical_position = float(kwargs["NanoTrak vertical position"])
+        self.original_horizontal_position = float(kwargs["NanoTrak horizontal position"])
+
+    def initialize_position_and_power_arrays(self, mode: str = "1D") -> None:
+        """Initialize position and power arrays for scanning."""
+        self.horizontal_positions = np.linspace(0, 10, self.scan_range)
+
+        if mode == "1D":
+            self.power_array = np.zeros(self.scan_range)
+            self.vertical_positions = np.array([0.0])
+
+        else:
+            self.power_array = np.zeros((self.scan_range, self.scan_range))
+            self.vertical_positions = np.linspace(0, 10, self.scan_range)
+
     def analyze_1d_power_array(self) -> bool:
         """Fit the 1D power array to find the best coupling position.
 
         Returns True if coupling is successful, False otherwise.
         """
-        # power = self.convert_voltage_to_dbm(self.power_array)
         # Ensure flat 1D array for curve fitting
         power = np.asarray(self.power_array).ravel()
 
+        # Normalize power to range from 0 to 1
+        power = power - np.min(power)
+        power = power / np.max(power)
+
+        self.update_sigma_range()
+        sigma_input = self.sigma_conversion(self.input_spot_size)
+        sigma_output = self.sigma_conversion(self.output_spot_size)
+
+        positions_um = self.horizontal_positions * 2
+
         try:
             # popt = Optimal parameters for the function, pcov = Covariance of the parameters
+            center_position = positions_um[np.argmax(power)]
             popt, pcov = curve_fit(
                 f=self.gaussian,
-                xdata=self.horizontal_positions,
+                xdata=positions_um,
                 ydata=power,
-                p0=[0.01, 5, 4],
+                p0=[1, center_position, np.sqrt(sigma_input**2 + sigma_output**2)],
             )
 
         except Exception as e:
@@ -202,11 +221,17 @@ class Main():
 
         return self.fit_is_valid(abs(popt[2]))
 
+    def update_sigma_range(self) -> None:
+        """Update the acceptable sigma range based on current spot sizes and maximum deviation."""
+        sigma_conv = self.calculate_gaussian_width(self.input_spot_size, self.output_spot_size)
+        self.sigma_min = sigma_conv * (1 - self.maximum_deviation / 100)
+        self.sigma_max = sigma_conv * (1 + self.maximum_deviation / 100)
+
     @staticmethod
     def convert_voltage_to_dbm(voltage: float | np.ndarray) -> float | np.ndarray:
         """Convert voltage reading to dBm."""
         step = ((voltage - 3.5) * 22.17647059) - 20.1
-        return 10**(step/10)  # ???
+        return 10**(step/10)
 
     @staticmethod
     def gaussian(x: np.ndarray, a: float, x0: float, sigma: float) -> np.ndarray:
@@ -222,10 +247,8 @@ class Main():
 
     def fit_is_valid(self, sigma: float) -> bool:
         """Check if the fitted Gauss width is within the maximum deviation."""
-        sigma_conv = self.calculate_gaussian_width(self.input_spot_size, self.output_spot_size)
-        sigma_min = sigma_conv * (1 - self.maximum_deviation / 100)
-        sigma_max = sigma_conv * (1 + self.maximum_deviation / 100)
-        return sigma_min <= sigma <= sigma_max
+        self.update_sigma_range()
+        return self.sigma_min <= sigma <= self.sigma_max
 
     def analyze_2d_power_array(self) -> bool:
         """Fit the 2D power array to find the best coupling position.
@@ -282,12 +305,8 @@ class Main():
 
         Returns the sigma
         """
-        def conversion(width: float) -> float:
-            """Convert width to sigma (standard deviation) for Gaussian function."""
-            return width / 4.0
-
-        sigma_input = conversion(input_spot_size)
-        sigma_output = conversion(output_spot_size)
+        sigma_input = self.sigma_conversion(input_spot_size)
+        sigma_output = self.sigma_conversion(output_spot_size)
 
         # Calculate Gaussian profile for input and output
         x = np.linspace(0, 20, 1000)
@@ -309,3 +328,8 @@ class Main():
         )
         sigma_conv = abs(popt[2])
         return sigma_conv
+
+    @staticmethod
+    def sigma_conversion(width: float) -> float:
+        """Convert width to sigma (standard deviation) for Gaussian function."""
+        return width / 4.0
