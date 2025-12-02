@@ -34,6 +34,7 @@ class Main():
         "Input spot size": 10.,
         "Output spot size": 10.,
         "Maximum deviation": 25.,
+        "Scan range": 21,
         "NanoTrak horizontal position": (),
         "NanoTrak vertical position": (),
         "Intensity": (),
@@ -75,6 +76,7 @@ class Main():
         self.maximum_deviation = float(kwargs["Maximum deviation"])
         self.input_spot_size = float(kwargs["Input spot size"])
         self.output_spot_size = float(kwargs["Output spot size"])
+        self.scan_range = int(kwargs["Scan range"])
         intensity = kwargs["Intensity"]
         operating = True
         passed = False
