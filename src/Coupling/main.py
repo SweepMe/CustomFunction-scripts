@@ -31,6 +31,7 @@ class Main():
     # add your arguments by defining keys and default values in the dictionary below
     arguments = {
         "Mode": ["1D", "2D"],
+        "Scan direction": ["Horizontal", "Vertical"],
         "Input spot size": 10.,
         "Output spot size": 10.,
         "Maximum deviation": 25.,
@@ -47,8 +48,10 @@ class Main():
 
         self.power_array: np.ndarray = np.array([])
         self.scan_range: int = 21
-        self.vertical_positions: np.array = np.array([0])
-        self.horizontal_positions: np.array = np.linspace(0, 10, self.scan_range)
+        self.positions_1d: np.ndarray = np.linspace(0, 10, self.scan_range)  # for 1D scans
+        self.vertical_positions: np.ndarray = np.linspace(0, 10, self.scan_range)  # for 2D scans
+        self.horizontal_positions: np.ndarray = np.linspace(0, 10, self.scan_range)  # for 2D scans
+        self.scan_direction: str = "Horizontal"
         # TODO: double-check vertical and horizontal uses
 
         self.last_position_index: int | tuple = -1
@@ -77,6 +80,7 @@ class Main():
         self.input_spot_size = float(kwargs["Input spot size"])
         self.output_spot_size = float(kwargs["Output spot size"])
         self.scan_range = int(kwargs["Scan range"])
+        self.scan_direction = kwargs["Scan direction"]
         intensity = kwargs["Intensity"]
         operating = True
         passed = False
@@ -90,8 +94,7 @@ class Main():
                 self.phase = Phase.SCANNING
 
                 self.last_position_index = 0
-                next_horizontal_position = self.horizontal_positions[0]
-                next_vertical_position = self.original_vertical_position
+                next_horizontal_position, next_vertical_position = self.get_positions(self.last_position_index)
 
             # SCANNING: save intensity for the last returned position, then return next position
             elif self.phase == Phase.SCANNING:
@@ -109,8 +112,7 @@ class Main():
                 else:
                     # advance to next scan index and return that position
                     self.last_position_index += 1
-                    next_horizontal_position = self.horizontal_positions[self.last_position_index]
-                    next_vertical_position = self.original_vertical_position
+                    next_horizontal_position, next_vertical_position = self.get_positions(self.last_position_index)
 
             # FINALIZE: run analysis and return passed with operating=False
             elif self.phase == Phase.FINALIZE:
@@ -180,15 +182,25 @@ class Main():
 
     def initialize_position_and_power_arrays(self, mode: str = "1D") -> None:
         """Initialize position and power arrays for scanning."""
-        self.horizontal_positions = np.linspace(0, 10, self.scan_range)
-
         if mode == "1D":
             self.power_array = np.zeros(self.scan_range)
-            self.vertical_positions = np.array([0.0])
+            self.positions_1d = np.linspace(0, 10, self.scan_range)
 
         else:
             self.power_array = np.zeros((self.scan_range, self.scan_range))
             self.vertical_positions = np.linspace(0, 10, self.scan_range)
+            self.horizontal_positions = np.linspace(0, 10, self.scan_range)
+
+    def get_positions(self, index: int) -> tuple[float, float]:
+        """Get the next horizontal and vertical positions to move to (1D)."""
+        if self.scan_direction == "Horizontal":
+            next_horizontal_position = self.positions_1d[index]
+            next_vertical_position = self.original_vertical_position
+        else:
+            next_horizontal_position = self.original_horizontal_position
+            next_vertical_position = self.positions_1d[index]
+
+        return next_horizontal_position, next_vertical_position
 
     def analyze_1d_power_array(self) -> bool:
         """Fit the 1D power array to find the best coupling position.
@@ -206,7 +218,10 @@ class Main():
         sigma_input = self.sigma_conversion(self.input_spot_size)
         sigma_output = self.sigma_conversion(self.output_spot_size)
 
-        positions_um = self.horizontal_positions * 2
+        if self.scan_direction == "Horizontal":
+            positions_um = self.horizontal_positions * 2
+        else:
+            positions_um = self.vertical_positions * 2
 
         try:
             # popt = Optimal parameters for the function, pcov = Covariance of the parameters
