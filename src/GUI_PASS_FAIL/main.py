@@ -29,6 +29,8 @@ class Main():
     
     arguments = {
         "State": "",
+        "PASS message": "PASS",
+        "FAIL message": "FAIL",
     }
 
     ## Attention: this function is called in the main GUI thread so that the widget is automatically
@@ -54,14 +56,16 @@ class Main():
     def main(self, **kwargs):
     
         state = kwargs["State"]
+        pass_message = kwargs.get("PASS message", "PASS")
+        fail_message = kwargs.get("FAIL message", "FAIL")
 
         if isinstance(state, str):
             state = state.lower()
 
         if state in ["true", True, 1, "1", "pass"]:
-            self.widget.pass_signal.emit()
+            self.widget.pass_signal.emit(pass_message)
         elif state in ["false", False, 0, "0", "fail"]:
-            self.widget.fail_signal.emit()
+            self.widget.fail_signal.emit(fail_message)
         else:
             msg=f"State {state!r} cannot be interpreted as pass or fail."
             raise ValueError(msg)
@@ -71,8 +75,8 @@ class Main():
 
 class Widget(QtWidgets.QWidget):
 
-    pass_signal = QtCore.Signal()
-    fail_signal = QtCore.Signal()
+    pass_signal = QtCore.Signal(str)
+    fail_signal = QtCore.Signal(str)
     reset_signal = QtCore.Signal()
     toggle_signal = QtCore.Signal()
 
@@ -94,9 +98,12 @@ class Widget(QtWidgets.QWidget):
         self.reset_signal.connect(self.reset)
         self.toggle_signal.connect(self.toggle_state)
 
+        self.fail_message: str = "FAIL"
+        self.pass_message: str = "PASS"
+
         # Initialize to start state
         self.reset()
-        
+
     def reset(self):
         """Set the widget to Start state."""
         self.label.setText("PASS/FAIL")
@@ -111,9 +118,10 @@ class Widget(QtWidgets.QWidget):
             }
         """)
 
-    def set_pass(self):
+    def set_pass(self, message: str = "PASS"):
         """Set the widget to PASS state."""
-        self.label.setText("PASS")
+        self.pass_message = message
+        self.label.setText(message)
         self.label.setStyleSheet("""
             QLabel {
                 background-color: limegreen;
@@ -125,9 +133,10 @@ class Widget(QtWidgets.QWidget):
             }
         """)
 
-    def set_fail(self):
+    def set_fail(self, message: str = "FAIL"):
         """Set the widget to FAIL state."""
-        self.label.setText("FAIL")
+        self.fail_message = message
+        self.label.setText(message)
         self.label.setStyleSheet("""
             QLabel {
                 background-color: red;
@@ -141,7 +150,7 @@ class Widget(QtWidgets.QWidget):
 
     def toggle_state(self):
         """Toggle between PASS and FAIL states."""
-        if self.label.text() == "PASS":
-            self.set_fail()
+        if self.label.text() == self.pass_message:
+            self.set_fail(self.fail_message)
         else:
-            self.set_pass()
+            self.set_pass(self.pass_message)
