@@ -11,6 +11,23 @@ from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT
 from matplotlib.figure import Figure
 
 
+# Shared color cycle — used by both SegmentTabWidget (tab icons) and PlotWidget (lines)
+# so that each segment's tab icon always matches its plot line color.
+COLORS = [
+    '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+    '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
+]
+
+def _segment_color(index):
+    return COLORS[index % len(COLORS)]
+
+def _color_icon(color_str):
+    """Small filled square icon used to link a tab visually to its plot line."""
+    pixmap = QtGui.QPixmap(12, 12)
+    pixmap.fill(QtGui.QColor(color_str))
+    return QtGui.QIcon(pixmap)
+
+
 class Main():
 
     variables = []
@@ -46,16 +63,16 @@ class Widget(QtWidgets.QWidget):
 
         self.setLayout(self._create_layout())
 
-        # Live plot updates whenever table data changes
-        self.table_widget.data_changed.connect(self.plot_widget.set_data)
+        # Live plot updates whenever any segment's table data changes
+        self.segment_tabs.segments_changed.connect(self.plot_widget.set_segments)
 
     def _create_layout(self):
         self.plot_widget = PlotWidget(self)
-        self.table_widget = TableWidget(self)
+        self.segment_tabs = SegmentTabWidget(self)
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         splitter.addWidget(self.plot_widget)
-        splitter.addWidget(self.table_widget)
+        splitter.addWidget(self.segment_tabs)
         splitter.setSizes([700, 300])
 
         grid = QtWidgets.QGridLayout()
@@ -78,6 +95,7 @@ class PlotWidget(QtWidgets.QWidget):
         )
 
         self.plotCanvas = MyMplCanvas(self)
+        self.lines = []
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setSpacing(0)
@@ -91,40 +109,161 @@ class PlotWidget(QtWidgets.QWidget):
         ax.set_ylabel("Voltage in V")
         ax.grid(True, linestyle='--', alpha=0.5)
 
-        self.line, = ax.plot([], [], linewidth=1.5, marker='o', markersize=4)
-
         self.plotCanvas.draw()
 
-    def set_data(self, x_list, y_list):
-        """Replace the full dataset shown in the plot."""
+    def set_segments(self, segments):
+        """Redraw all segment lines from scratch.
+
+        segments: list of (xs, ys) tuples, one entry per segment tab.
+        Lines are removed and recreated on every call so that colors always
+        stay in sync with the tab order.
+        """
+        ax = self.plotCanvas.axes
+
+        for line in self.lines:
+            line.remove()
+        self.lines = []
+
+        for i, (xs, ys) in enumerate(segments):
+            line, = ax.plot(
+                xs, ys,
+                linewidth=1.5, marker='o', markersize=4,
+                color=_segment_color(i),
+            )
+            self.lines.append(line)
+
         try:
-            xs = [float(v) for v in x_list]
-            ys = [float(v) for v in y_list]
-        except Exception:
-            return
-        try:
-            plt.setp(self.line, xdata=xs, ydata=ys)
-            self.plotCanvas.axes.relim()
-            self.plotCanvas.axes.autoscale_view()
+            ax.relim()
+            ax.autoscale_view()
             self.plotCanvas.fig.tight_layout(pad=0.2)
             self.plotCanvas.draw()
         except Exception:
             error()
 
     def clear_data(self):
+        ax = self.plotCanvas.axes
+        for line in self.lines:
+            line.remove()
+        self.lines = []
         try:
-            plt.setp(self.line, xdata=[], ydata=[])
             self.plotCanvas.draw()
         except Exception:
             pass
 
 
 # ---------------------------------------------------------------------------
-# Editable table widget
+# Multi-segment tab widget
+# ---------------------------------------------------------------------------
+
+class SegmentTabWidget(QtWidgets.QTabWidget):
+    """QTabWidget holding one TableWidget per pulse segment.
+
+    A permanent "+" tab at the end lets the user add new segments. Tabs are
+    closable, but at least one segment is always kept. Each tab shows a small
+    colored icon that matches its corresponding plot line.
+    """
+
+    segments_changed = QtCore.Signal(list)  # list of (xs, ys) tuples, one per segment
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self._plus_tab_added = False
+        self.setTabsClosable(True)
+        self.tabCloseRequested.connect(self._on_close_tab)
+        self.currentChanged.connect(self._on_current_changed)
+
+        self._add_segment_tab()  # initial segment
+        self._append_plus_tab()  # "+" tab at the end
+
+    # ------------------------------------------------------------------
+    # Internal structure helpers
+    # ------------------------------------------------------------------
+
+    def _segment_count(self):
+        """Number of segment tabs, excluding the "+" tab."""
+        return self.count() - 1
+
+    def _append_plus_tab(self):
+        self.addTab(QtWidgets.QWidget(), "+")
+        self._plus_tab_added = True
+        self._hide_plus_close_button()
+
+    def _hide_plus_close_button(self):
+        """Remove the close button from the "+" tab after any structural change."""
+        plus_idx = self.count() - 1
+        self.tabBar().setTabButton(plus_idx, QtWidgets.QTabBar.RightSide, None)
+        self.tabBar().setTabButton(plus_idx, QtWidgets.QTabBar.LeftSide, None)
+
+    def _add_segment_tab(self):
+        """Insert a new segment tab before the "+" tab and switch to it."""
+        seg_idx = self._segment_count()
+        table = TableWidget()
+        table.data_changed.connect(self._on_any_data_changed)
+
+        insert_pos = self.count() - 1 if self._plus_tab_added else self.count()
+
+        # Block currentChanged so inserting/switching doesn't trigger _on_current_changed
+        self.blockSignals(True)
+        self.insertTab(insert_pos, table, "Segment %d" % (seg_idx + 1))
+        self.setTabIcon(insert_pos, _color_icon(_segment_color(seg_idx)))
+        self.setCurrentIndex(insert_pos)
+        self.blockSignals(False)
+
+        self._hide_plus_close_button()
+
+    def _reindex_tabs(self):
+        """Rename tabs and refresh icons after a segment is removed."""
+        for i in range(self._segment_count()):
+            self.setTabText(i, "Segment %d" % (i + 1))
+            self.setTabIcon(i, _color_icon(_segment_color(i)))
+
+    def _get_all_segments(self):
+        return [self.widget(i).get_pulse_data() for i in range(self._segment_count())]
+
+    # ------------------------------------------------------------------
+    # Slots
+    # ------------------------------------------------------------------
+
+    def _on_current_changed(self, index):
+        """Clicking the "+" tab creates a new segment instead of staying on it."""
+        if self._plus_tab_added and index == self.count() - 1:
+            self._add_segment_tab()
+            self.segments_changed.emit(self._get_all_segments())
+
+    def _on_close_tab(self, index):
+        if self._segment_count() <= 1:
+            return  # always keep at least one segment
+
+        self.blockSignals(True)
+        self.removeTab(index)
+        self._reindex_tabs()
+        # Ensure the "+" tab is not left as the active tab
+        if self.currentIndex() == self.count() - 1:
+            self.setCurrentIndex(self.count() - 2)
+        self.blockSignals(False)
+
+        self._hide_plus_close_button()
+        self.segments_changed.emit(self._get_all_segments())
+
+    def _on_any_data_changed(self):
+        self.segments_changed.emit(self._get_all_segments())
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def get_all_segments(self):
+        """Return [(timestamps, voltages), ...] for all segments."""
+        return self._get_all_segments()
+
+
+# ---------------------------------------------------------------------------
+# Editable table widget (one per segment)
 # ---------------------------------------------------------------------------
 
 class TableWidget(QtWidgets.QWidget):
-    """Two-column editable table: Time (s) | Voltage.
+    """Two-column editable table: Time in s | Voltage in V.
 
     Always keeps one empty trailing row for new input. Emits data_changed
     with the current valid (time, voltage) pairs whenever any edit occurs.
@@ -168,7 +307,7 @@ class TableWidget(QtWidgets.QWidget):
         self.btn_delete.clicked.connect(self._on_delete_rows)
         self.btn_clear.clicked.connect(self.clear_data)
 
-        self._ensure_trailing_empty_row()
+        self._add_empty_rows(10)
 
     # ------------------------------------------------------------------
     # Row management
@@ -211,6 +350,16 @@ class TableWidget(QtWidgets.QWidget):
             (it0 is None or it0.text().strip() == '') and
             (it1 is None or it1.text().strip() == '')
         )
+
+    def _add_empty_rows(self, n=10):
+        """Append n blank rows without triggering cell-changed signals."""
+        self._block_cell_signals = True
+        for _ in range(n):
+            r = self.table.rowCount()
+            self.table.insertRow(r)
+            self.table.setItem(r, 0, QtWidgets.QTableWidgetItem(''))
+            self.table.setItem(r, 1, QtWidgets.QTableWidgetItem(''))
+        self._block_cell_signals = False
 
     def _ensure_trailing_empty_row(self):
         rows = self.table.rowCount()
@@ -286,10 +435,12 @@ class TableWidget(QtWidgets.QWidget):
                 ttxt, vtxt = t.text().strip(), v.text().strip()
                 if not ttxt or not vtxt:
                     continue
-                xs.append(float(ttxt))
-                ys.append(float(vtxt))
+                x = float(ttxt)
+                y = float(vtxt)
             except Exception:
                 continue
+            xs.append(x)
+            ys.append(y)
         self.data_changed.emit(xs, ys)
 
     def get_pulse_data(self):
@@ -299,15 +450,17 @@ class TableWidget(QtWidgets.QWidget):
             try:
                 t = self.table.item(r, 0)
                 v = self.table.item(r, 1)
-                xs.append(float(t.text().strip()))
-                ys.append(float(v.text().strip()))
+                x = float(t.text().strip())
+                y = float(v.text().strip())
             except Exception:
                 continue
+            xs.append(x)
+            ys.append(y)
         return xs, ys
 
     def clear_data(self):
         self.table.setRowCount(0)
-        self._ensure_trailing_empty_row()
+        self._add_empty_rows(10)
         self._emit_data_changed()
 
 
