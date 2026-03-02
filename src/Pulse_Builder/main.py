@@ -4,6 +4,7 @@
 
 from pysweepme.ErrorMessage import error
 
+import csv
 from PySide2 import QtWidgets, QtGui, QtCore
 from matplotlib import pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -105,24 +106,29 @@ class Widget(QtWidgets.QWidget):
         self.waveform_table.waveform_changed.connect(self._on_waveform_changed)
 
     def _create_layout(self):
-        self.plot_widget   = PlotWidget(self)
-        self.sequence_tabs = SequenceTabWidget(self)
+        self.plot_widget    = PlotWidget()
+        self.sequence_tabs  = SequenceTabWidget(self)
         self.waveform_table = WaveformTableWidget(self)
 
-        # Right panel: sequence tabs on top, waveform table on bottom
-        right_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        right_splitter.addWidget(self.sequence_tabs)
-        right_splitter.addWidget(self.waveform_table)
-        right_splitter.setSizes([350, 200])
+        # Top row: sequence plot (left) + sequence tabs (right)
+        top_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        top_splitter.addWidget(self.plot_widget.seq_canvas)
+        top_splitter.addWidget(self.sequence_tabs)
+        top_splitter.setSizes([500, 300])
 
-        # Main horizontal split: plot (left) | right panel
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        splitter.addWidget(self.plot_widget)
-        splitter.addWidget(right_splitter)
-        splitter.setSizes([700, 300])
+        # Bottom row: waveform plot (left) + waveform table (right)
+        bot_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        bot_splitter.addWidget(self.plot_widget.wf_canvas)
+        bot_splitter.addWidget(self.waveform_table)
+        bot_splitter.setSizes([500, 300])
+
+        # Vertical split between the two rows
+        v_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        v_splitter.addWidget(top_splitter)
+        v_splitter.addWidget(bot_splitter)
 
         grid = QtWidgets.QGridLayout()
-        grid.addWidget(splitter, 0, 0)
+        grid.addWidget(v_splitter, 0, 0)
         return grid
 
     def _on_sequences_changed(self, sequences):
@@ -141,22 +147,17 @@ class Widget(QtWidgets.QWidget):
 
 
 # ---------------------------------------------------------------------------
-# Matplotlib plot widget — two tabs: Sequences + Waveform
+# Plot manager — plain Python class, not a QWidget.
+# Owns two MyMplCanvas instances that Widget places directly in the layout.
 # ---------------------------------------------------------------------------
 
-class PlotWidget(QtWidgets.QWidget):
+class PlotWidget:
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-
-        self.setSizePolicy(
-            QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Expanding,
-                                  QtWidgets.QSizePolicy.Expanding)
-        )
+    def __init__(self):
+        self.lines = []
 
         # --- Sequences canvas ---
-        self.seq_canvas = MyMplCanvas(self)
-        self.lines = []
+        self.seq_canvas = MyMplCanvas()
         seq_ax = self.seq_canvas.fig.add_subplot(111)
         self.seq_canvas.axes = seq_ax
         seq_ax.set_title("Sequences")
@@ -166,7 +167,7 @@ class PlotWidget(QtWidgets.QWidget):
         self.seq_canvas.draw()
 
         # --- Waveform canvas ---
-        self.wf_canvas = MyMplCanvas(self)
+        self.wf_canvas = MyMplCanvas()
         wf_ax = self.wf_canvas.fig.add_subplot(111)
         self.wf_canvas.axes = wf_ax
         wf_ax.set_title("Waveform")
@@ -175,16 +176,6 @@ class PlotWidget(QtWidgets.QWidget):
         wf_ax.grid(True, linestyle='--', alpha=0.5)
         self.waveform_line, = wf_ax.plot([], [], linewidth=1.5, marker='o', markersize=4)
         self.wf_canvas.draw()
-
-        # --- Tab widget holding both canvases ---
-        self.tab_widget = QtWidgets.QTabWidget(self)
-        self.tab_widget.addTab(self.seq_canvas, "Sequences")
-        self.tab_widget.addTab(self.wf_canvas, "Waveform")
-
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setSpacing(0)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self.tab_widget)
 
     def set_segments(self, segments):
         """Redraw all sequence lines from scratch.
@@ -273,7 +264,7 @@ class SequenceTabWidget(QtWidgets.QTabWidget):
 
     def _sequence_count(self):
         """Number of sequence tabs, excluding the "+" tab."""
-        return self.count() - 1
+        return self.count() - 1 if self._plus_tab_added else self.count()
 
     def _append_plus_tab(self):
         self.addTab(QtWidgets.QWidget(), "+")
@@ -386,9 +377,11 @@ class TableWidget(QtWidgets.QWidget):
         self.btn_insert = QtWidgets.QPushButton("Insert Above")
         self.btn_delete = QtWidgets.QPushButton("Delete Row")
         self.btn_clear  = QtWidgets.QPushButton("Clear All")
+        self.btn_csv    = QtWidgets.QPushButton("Load from CSV")
         btn_bar.addWidget(self.btn_insert)
         btn_bar.addWidget(self.btn_delete)
         btn_bar.addWidget(self.btn_clear)
+        btn_bar.addWidget(self.btn_csv)
         layout.addLayout(btn_bar)
 
         # --- connections ---
@@ -397,6 +390,7 @@ class TableWidget(QtWidgets.QWidget):
         self.btn_insert.clicked.connect(self._on_insert_above)
         self.btn_delete.clicked.connect(self._on_delete_rows)
         self.btn_clear.clicked.connect(self.clear_data)
+        self.btn_csv.clicked.connect(self._on_load_csv)
 
         self._add_empty_rows(10)
 
@@ -547,6 +541,43 @@ class TableWidget(QtWidgets.QWidget):
             ys.append(y)
         return xs, ys
 
+    def _on_load_csv(self):
+        """Open a CSV file and replace the table contents with its data.
+
+        Expected format: two columns, time and voltage, one row per line.
+        A header row or any non-numeric line is silently skipped.
+        """
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self.table, "Load Sequence from CSV", "",
+            "CSV files (*.csv);;All files (*.*)"
+        )
+        if not path:
+            return
+        try:
+            rows = []
+            with open(path, newline='') as f:
+                for row in csv.reader(f):
+                    if len(row) < 2:
+                        continue
+                    try:
+                        rows.append((float(row[0].strip()), float(row[1].strip())))
+                    except ValueError:
+                        continue  # skip header or non-numeric lines
+            if not rows:
+                return
+            self.table.setRowCount(0)
+            self._block_cell_signals = True
+            for x, y in rows:
+                r = self.table.rowCount()
+                self.table.insertRow(r)
+                self.table.setItem(r, 0, QtWidgets.QTableWidgetItem("%1.6g" % x))
+                self.table.setItem(r, 1, QtWidgets.QTableWidgetItem("%1.6g" % y))
+            self._block_cell_signals = False
+            self._ensure_trailing_empty_row()
+            self._emit_data_changed()
+        except Exception:
+            error()
+
     def clear_data(self):
         self.table.setRowCount(0)
         self._add_empty_rows(10)
@@ -599,9 +630,11 @@ class WaveformTableWidget(QtWidgets.QWidget):
         self.btn_insert = QtWidgets.QPushButton("Insert Above")
         self.btn_delete = QtWidgets.QPushButton("Delete Row")
         self.btn_clear  = QtWidgets.QPushButton("Clear All")
+        self.btn_csv    = QtWidgets.QPushButton("Load from CSV")
         btn_bar.addWidget(self.btn_insert)
         btn_bar.addWidget(self.btn_delete)
         btn_bar.addWidget(self.btn_clear)
+        btn_bar.addWidget(self.btn_csv)
         layout.addLayout(btn_bar)
 
         # --- connections ---
@@ -610,6 +643,7 @@ class WaveformTableWidget(QtWidgets.QWidget):
         self.btn_insert.clicked.connect(self._on_insert_above)
         self.btn_delete.clicked.connect(self._on_delete_rows)
         self.btn_clear.clicked.connect(self.clear_data)
+        self.btn_csv.clicked.connect(self._on_load_csv)
 
         self._add_empty_rows(10)
 
@@ -768,6 +802,46 @@ class WaveformTableWidget(QtWidgets.QWidget):
                 continue
             entries.append((seq_id, reps))
         return entries
+
+    def _on_load_csv(self):
+        """Open a CSV file and replace the waveform table contents with its data.
+
+        Expected format: two columns, sequence ID and repetitions (positive integers),
+        one row per line. A header row or any non-integer line is silently skipped.
+        """
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self.table, "Load Waveform from CSV", "",
+            "CSV files (*.csv);;All files (*.*)"
+        )
+        if not path:
+            return
+        try:
+            rows = []
+            with open(path, newline='') as f:
+                for row in csv.reader(f):
+                    if len(row) < 2:
+                        continue
+                    try:
+                        seq_id = int(row[0].strip())
+                        reps   = int(row[1].strip())
+                        if seq_id >= 1 and reps >= 1:
+                            rows.append((seq_id, reps))
+                    except ValueError:
+                        continue  # skip header or non-integer lines
+            if not rows:
+                return
+            self.table.setRowCount(0)
+            self._block_cell_signals = True
+            for seq_id, reps in rows:
+                r = self.table.rowCount()
+                self.table.insertRow(r)
+                self.table.setItem(r, 0, QtWidgets.QTableWidgetItem("%d" % seq_id))
+                self.table.setItem(r, 1, QtWidgets.QTableWidgetItem("%d" % reps))
+            self._block_cell_signals = False
+            self._ensure_trailing_empty_row()
+            self._emit_waveform_changed()
+        except Exception:
+            error()
 
     def clear_data(self):
         self.table.setRowCount(0)
