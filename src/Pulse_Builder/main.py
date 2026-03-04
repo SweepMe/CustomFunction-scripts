@@ -12,6 +12,8 @@ from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT
 from matplotlib.figure import Figure
 
 
+CSV_DEFAULT_DIR = r"C:\Users\Public\Documents\SweepMe!\CustomFiles"
+
 # Shared color cycle — used by both SequenceTabWidget (tab icons) and PlotWidget (lines)
 # so that each sequence's tab icon always matches its plot line color.
 COLORS = [
@@ -374,14 +376,16 @@ class TableWidget(QtWidgets.QWidget):
 
         # --- row management buttons ---
         btn_bar = QtWidgets.QHBoxLayout()
-        self.btn_insert = QtWidgets.QPushButton("Insert Above")
-        self.btn_delete = QtWidgets.QPushButton("Delete Row")
-        self.btn_clear  = QtWidgets.QPushButton("Clear All")
-        self.btn_csv    = QtWidgets.QPushButton("Load from CSV")
+        self.btn_insert   = QtWidgets.QPushButton("Insert Above")
+        self.btn_delete   = QtWidgets.QPushButton("Delete Row")
+        self.btn_clear    = QtWidgets.QPushButton("Clear All")
+        self.btn_load_csv = QtWidgets.QPushButton("Load from CSV")
+        self.btn_save_csv = QtWidgets.QPushButton("Save to CSV")
         btn_bar.addWidget(self.btn_insert)
         btn_bar.addWidget(self.btn_delete)
         btn_bar.addWidget(self.btn_clear)
-        btn_bar.addWidget(self.btn_csv)
+        btn_bar.addWidget(self.btn_load_csv)
+        btn_bar.addWidget(self.btn_save_csv)
         layout.addLayout(btn_bar)
 
         # --- connections ---
@@ -390,7 +394,8 @@ class TableWidget(QtWidgets.QWidget):
         self.btn_insert.clicked.connect(self._on_insert_above)
         self.btn_delete.clicked.connect(self._on_delete_rows)
         self.btn_clear.clicked.connect(self.clear_data)
-        self.btn_csv.clicked.connect(self._on_load_csv)
+        self.btn_load_csv.clicked.connect(self._on_load_csv)
+        self.btn_save_csv.clicked.connect(self._on_save_csv)
 
         self._add_empty_rows(10)
 
@@ -541,6 +546,24 @@ class TableWidget(QtWidgets.QWidget):
             ys.append(y)
         return xs, ys
 
+    def _on_save_csv(self):
+        """Save all valid table rows to a CSV file (time, voltage)."""
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self.table, "Save Sequence to CSV", CSV_DEFAULT_DIR,
+            "CSV files (*.csv);;All files (*.*)"
+        )
+        if not path:
+            return
+        try:
+            xs, ys = self.get_pulse_data()
+            with open(path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(["Time in s", "Voltage in V"])
+                for x, y in zip(xs, ys):
+                    writer.writerow(["%1.6g" % x, "%1.6g" % y])
+        except Exception:
+            error()
+
     def _on_load_csv(self):
         """Open a CSV file and replace the table contents with its data.
 
@@ -548,7 +571,7 @@ class TableWidget(QtWidgets.QWidget):
         A header row or any non-numeric line is silently skipped.
         """
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self.table, "Load Sequence from CSV", "",
+            self.table, "Load Sequence from CSV", CSV_DEFAULT_DIR,
             "CSV files (*.csv);;All files (*.*)"
         )
         if not path:
@@ -627,14 +650,16 @@ class WaveformTableWidget(QtWidgets.QWidget):
 
         # --- row management buttons ---
         btn_bar = QtWidgets.QHBoxLayout()
-        self.btn_insert = QtWidgets.QPushButton("Insert Above")
-        self.btn_delete = QtWidgets.QPushButton("Delete Row")
-        self.btn_clear  = QtWidgets.QPushButton("Clear All")
-        self.btn_csv    = QtWidgets.QPushButton("Load from CSV")
+        self.btn_insert   = QtWidgets.QPushButton("Insert Above")
+        self.btn_delete   = QtWidgets.QPushButton("Delete Row")
+        self.btn_clear    = QtWidgets.QPushButton("Clear All")
+        self.btn_load_csv = QtWidgets.QPushButton("Load from CSV")
+        self.btn_save_csv = QtWidgets.QPushButton("Save to CSV")
         btn_bar.addWidget(self.btn_insert)
         btn_bar.addWidget(self.btn_delete)
         btn_bar.addWidget(self.btn_clear)
-        btn_bar.addWidget(self.btn_csv)
+        btn_bar.addWidget(self.btn_load_csv)
+        btn_bar.addWidget(self.btn_save_csv)
         layout.addLayout(btn_bar)
 
         # --- connections ---
@@ -643,7 +668,8 @@ class WaveformTableWidget(QtWidgets.QWidget):
         self.btn_insert.clicked.connect(self._on_insert_above)
         self.btn_delete.clicked.connect(self._on_delete_rows)
         self.btn_clear.clicked.connect(self.clear_data)
-        self.btn_csv.clicked.connect(self._on_load_csv)
+        self.btn_load_csv.clicked.connect(self._on_load_csv)
+        self.btn_save_csv.clicked.connect(self._on_save_csv)
 
         self._add_empty_rows(10)
 
@@ -803,6 +829,24 @@ class WaveformTableWidget(QtWidgets.QWidget):
             entries.append((seq_id, reps))
         return entries
 
+    def _on_save_csv(self):
+        """Save all valid waveform rows to a CSV file (sequence ID, repetitions)."""
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self.table, "Save Waveform to CSV", CSV_DEFAULT_DIR,
+            "CSV files (*.csv);;All files (*.*)"
+        )
+        if not path:
+            return
+        try:
+            entries = self.get_waveform_data()
+            with open(path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(["Sequence", "Repetitions"])
+                for seq_id, reps in entries:
+                    writer.writerow([seq_id, reps])
+        except Exception:
+            error()
+
     def _on_load_csv(self):
         """Open a CSV file and replace the waveform table contents with its data.
 
@@ -810,7 +854,7 @@ class WaveformTableWidget(QtWidgets.QWidget):
         one row per line. A header row or any non-integer line is silently skipped.
         """
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self.table, "Load Waveform from CSV", "",
+            self.table, "Load Waveform from CSV", CSV_DEFAULT_DIR,
             "CSV files (*.csv);;All files (*.*)"
         )
         if not path:
