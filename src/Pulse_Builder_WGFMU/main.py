@@ -5,8 +5,12 @@
 import csv
 from PySide2 import QtWidgets, QtGui, QtCore
 
+import time
+
 from pysweepme import FolderManager
 FolderManager.addFolderToPATH()
+
+import wgfmu
 
 from pulse_builder import (
     Widget,
@@ -421,8 +425,17 @@ class WGFMUWidget(Widget):
 
 class Main():
 
-    variables = []
-    units = []
+    variables = ["Timestamp", "Measured value"]
+    units     = ["s", ""]   # second unit set dynamically in initialize()
+
+    arguments = {
+        "Address":                    "GPIB0::16::INSTR",
+        "Slot":                       1,
+        "Channel":                    1,
+        "Measure mode":               ["Voltage", "Current"],
+        "Measure event average in s": 0.0,
+    }
+    execution = "process"
 
     def renew_widget(self, widget=None):
         """Gets the widget from the module and returns the same or creates a new one.
@@ -436,8 +449,138 @@ class Main():
         return self.widget
 
     def initialize(self):
-        # Preserve the user-defined pulse form across runs — do not clear the table.
-        pass
+        """Load the DLL, open a session, and connect to the channel.
 
-    def main(self):
-        return
+        self.main_arguments is available here before the first main() call.
+        Widget data is intentionally not cleared so the user's pulse definition
+        is preserved across measurement runs.
+        """
+        address              = self.main_arguments["Address"]
+        slot                 = int(self.main_arguments["Slot"])
+        channel              = int(self.main_arguments["Channel"])
+        self.measure_mode    = self.main_arguments["Measure mode"]
+        self.measure_average = float(self.main_arguments["Measure event average in s"])
+        self.channel_id      = wgfmu.create_channel_id(slot, channel)
+
+        # Reflect measurement type in the output unit column
+        self.units = ["s", "V" if "voltage" in self.measure_mode.lower() else "A"]
+
+        wgfmu.load_dll()
+        wgfmu.open_session(address)
+        wgfmu.initialize()
+        wgfmu.clear()  # clear any previous state (patterns, sequences, etc.)
+        wgfmu.connect(self.channel_id)
+
+    def deinitialize(self):
+        """Disconnect the channel and close the WGFMU session."""
+        wgfmu.disconnect(self.channel_id)
+        wgfmu.close_session()
+
+    def configure(self):
+        """Upload patterns and sequences from the widget to the hardware.
+
+        Called every time the module enters an active sequencer branch.
+        Reads sequence tabs (time increments, voltages, measure events) and
+        the waveform table (playback order + repetitions).
+        """
+        wgfmu.clear()
+
+        n_seqs = self.widget.sequence_tabs._sequence_count()
+        self.measure_events = []
+        for i in range(n_seqs):
+            tab = self.widget.sequence_tabs.widget(i)
+            increments, voltages = tab.get_incremental_data()
+            if not increments:
+                continue
+
+            if increments[0] != 0.0:
+                raise ValueError(
+                    f"Sequence {i + 1}: first time increment must be 0.0 s "
+                    f"(got {increments[0]})."
+                )
+
+            pattern_name = f"pattern_{i}"
+            wgfmu.create_pattern(pattern_name, voltages[0])
+            if len(increments) > 1:
+                # print(f"Pattern {pattern_name} with {increments[1:]} s increments and {voltages[1:]} V voltages")
+                wgfmu.add_vector_array(pattern_name, increments[1:], voltages[1:])
+
+            for j, (start, points, interval) in enumerate(tab.get_measure_events()):
+                self.measure_events.append((start, points, interval))
+                wgfmu.set_measure_event(
+                    pattern_name,
+                    event=f"event_{i}_{j}",
+                    start_time=start,
+                    points=points,
+                    interval=interval,
+                    average=self.measure_average,
+                    mode="average",
+                )
+
+        for seq_id, reps in self.widget.waveform_table.get_waveform_data():
+            wgfmu.add_sequence(self.channel_id, f"pattern_{seq_id - 1}", reps)
+
+        wgfmu.set_operation_mode(self.channel_id, wgfmu.OperationMode.FASTIV)
+        measure_mode = "Voltage" if "voltage" in self.measure_mode.lower() else "Current"
+        wgfmu.set_measure_mode(self.channel_id, measure_mode)
+
+    def measure(self) -> None:
+        """Perform the measurement."""
+        print("Starting measurement...")
+        wgfmu.execute()
+        time.sleep(1)
+        # TODO: wait for the status to be RUNNING
+
+    def request_result(self) -> None:
+        """Each channel waits until its status is not 'RUNNING'."""
+        while True:
+            if self.is_run_stopped():
+                break
+
+            status, elapsed_time, estimated_total_time = wgfmu.get_channel_status(self.channel_id)
+            # print(f"Status: {status}, Elapsed time: {elapsed_time:.2f}s, Estimated total time: {estimated_total_time:.2f}s")
+            if status != wgfmu.ChannelStatus.RUNNING:
+                break
+
+            if elapsed_time > 2 * estimated_total_time:
+                msg = f"Measurement is taking much longer than estimated (elapsed: {elapsed_time:.2f}s, estimated total: {estimated_total_time:.2f}s). Stopping measurement."
+                raise RuntimeError(msg)
+
+            time.sleep(0.5)
+
+    def read_result(self) -> None:
+        """Read the results."""
+        if not self.measure_events:
+            # No measurement events defined, so no results to read
+            return
+
+        completed_points, total_points = wgfmu.get_measure_value_size(self.channel_id)
+        print(f"Completed measure points: {completed_points}, Total measure points: {total_points}")
+        if completed_points < 1:
+            msg = "No measurement points completed. Cannot read results."
+            raise RuntimeError(msg)
+        self.measured_timestamps, self.measured_voltages = wgfmu.get_measure_values(self.channel_id, 0, completed_points)
+
+    def main(self, **kwargs):
+        """Execute the waveform, wait for completion, and return measured data."""
+        # wgfmu.execute()
+        #
+        # while True:
+        #     status, elapsed, estimated = wgfmu.get_channel_status(self.channel_id)
+        #     if status != wgfmu.ChannelStatus.RUNNING:
+        #         break
+        #     if estimated > 0 and elapsed > 2 * estimated:
+        #         raise RuntimeError(
+        #             f"Measurement timeout "
+        #             f"(elapsed {elapsed:.2f} s, estimated {estimated:.2f} s)."
+        #         )
+        #     time.sleep(0.05)
+        #
+        # completed, _total = wgfmu.get_measure_value_size(self.channel_id)
+        # if completed < 1:
+        #     return [], []
+
+        # timestamps, values = wgfmu.get_measure_values(self.channel_id, 0, completed)
+
+        # TODO: add execution = 'call'
+        return self.measured_timestamps, self.measured_voltages
