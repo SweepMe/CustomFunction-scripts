@@ -62,7 +62,7 @@ class Main():
                         success = True
                         break
         
-                except Exception as err:
+                except requests.exceptions.RequestException as err:
                     error_message = err
                     
                 if i == retries:
