@@ -36,7 +36,7 @@ class Main():
     def main(self, **kwargs):
         
         i = 0
-        data = str(kwargs["Data"][-1])
+        data = str(kwargs["Data"][-1]) if kwargs["Data"] else ""
         retries = kwargs["Retries"]
         timeout = kwargs["Timeout"]
         url = kwargs["URL"]
