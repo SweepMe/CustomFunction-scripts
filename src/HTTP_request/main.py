@@ -53,8 +53,8 @@ class Main():
                 i += 1
                 try:
                     headers = {'Content-type': content_type}
-                    response = requests.post(url, data=data, timeout=timeout, headers=headers, verify=False)  # needed if SSL certificates fail
-                    # response = requests.post(url, data=data, timeout=timeout, headers=headers, verify=CERTFILE)
+                    # response = requests.post(url, data=data, timeout=timeout, headers=headers, verify=False)  # needed if SSL certificates fail
+                    response = requests.post(url, data=data, timeout=timeout, headers=headers, verify=CERTFILE)
                     response_text = response.text
                     response.raise_for_status()
                     if response.status_code == 200:
