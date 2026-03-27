@@ -76,7 +76,7 @@ class Widget(QtWidgets.QWidget):
 
         # Initialize sequence count for waveform table validation
         self._sequences = self.sequence_tabs.get_all_sequences()
-        self.waveform_table.update_sequence_count(len(self._sequences))
+        self.waveform_table.updatesequence_count(len(self._sequences))
 
         # Wire signals
         self.sequence_tabs.sequences_changed.connect(self._on_sequences_changed)
@@ -111,7 +111,7 @@ class Widget(QtWidgets.QWidget):
     def _on_sequences_changed(self, sequences):
         self._sequences = sequences
         self.plot_widget.set_segments(sequences)
-        self.waveform_table.update_sequence_count(len(sequences))
+        self.waveform_table.updatesequence_count(len(sequences))
         self._recompute_waveform()
 
     def _on_waveform_changed(self, entries):
@@ -232,14 +232,14 @@ class SequenceTabWidget(QtWidgets.QTabWidget):
         self.tabCloseRequested.connect(self._on_close_tab)
         self.currentChanged.connect(self._on_current_changed)
 
-        self._add_sequence_tab()  # initial sequence
+        self.add_sequence_tab()  # initial sequence
         self._append_plus_tab()   # "+" tab at the end
 
     # ------------------------------------------------------------------
     # Internal structure helpers
     # ------------------------------------------------------------------
 
-    def _sequence_count(self):
+    def sequence_count(self):
         """Number of sequence tabs, excluding the "+" tab."""
         return self.count() - 1 if self._plus_tab_added else self.count()
 
@@ -254,9 +254,9 @@ class SequenceTabWidget(QtWidgets.QTabWidget):
         self.tabBar().setTabButton(plus_idx, QtWidgets.QTabBar.RightSide, None)
         self.tabBar().setTabButton(plus_idx, QtWidgets.QTabBar.LeftSide, None)
 
-    def _add_sequence_tab(self):
+    def add_sequence_tab(self):
         """Insert a new sequence tab before the "+" tab and switch to it."""
-        seq_idx = self._sequence_count()
+        seq_idx = self.sequence_count()
         table = TableWidget()
         table.data_changed.connect(self._on_any_data_changed)
 
@@ -273,12 +273,12 @@ class SequenceTabWidget(QtWidgets.QTabWidget):
 
     def _reindex_tabs(self):
         """Rename tabs and refresh icons after a sequence is removed."""
-        for i in range(self._sequence_count()):
+        for i in range(self.sequence_count()):
             self.setTabText(i, "Sequence %d" % (i + 1))
             self.setTabIcon(i, _color_icon(_sequence_color(i)))
 
     def _get_all_sequences(self):
-        return [self.widget(i).get_pulse_data() for i in range(self._sequence_count())]
+        return [self.widget(i).get_pulse_data() for i in range(self.sequence_count())]
 
     # ------------------------------------------------------------------
     # Slots
@@ -287,11 +287,11 @@ class SequenceTabWidget(QtWidgets.QTabWidget):
     def _on_current_changed(self, index):
         """Clicking the "+" tab creates a new sequence instead of staying on it."""
         if self._plus_tab_added and index == self.count() - 1:
-            self._add_sequence_tab()
+            self.add_sequence_tab()
             self.sequences_changed.emit(self._get_all_sequences())
 
     def _on_close_tab(self, index):
-        if self._sequence_count() <= 1:
+        if self.sequence_count() <= 1:
             return  # always keep at least one sequence
 
         self.blockSignals(True)
@@ -373,6 +373,8 @@ class TableWidget(QtWidgets.QWidget):
         self.btn_save_csv.clicked.connect(self._on_save_csv)
 
         self._add_empty_rows(10)
+
+        self.csv_path: str = ""
 
     # ------------------------------------------------------------------
     # Row management
@@ -536,6 +538,7 @@ class TableWidget(QtWidgets.QWidget):
                 writer.writerow(["Time in s", "Voltage in V"])
                 for x, y in zip(xs, ys):
                     writer.writerow(["%1.6g" % x, "%1.6g" % y])
+            self.csv_path = path
         except Exception:
             error()
 
@@ -551,6 +554,11 @@ class TableWidget(QtWidgets.QWidget):
         )
         if not path:
             return
+
+        self.load_from_csv(path)
+
+    def load_from_csv(self, path) -> None:
+        """Load sequence data from a CSV file at the given path, replacing the table contents."""
         try:
             rows = []
             with open(path, newline='') as f:
@@ -573,6 +581,7 @@ class TableWidget(QtWidgets.QWidget):
             self._block_cell_signals = False
             self._ensure_trailing_empty_row()
             self._emit_data_changed()
+            self.csv_path = path
         except Exception:
             error()
 
@@ -604,7 +613,7 @@ class WaveformTableWidget(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        self._n_sequences = 0  # updated externally via update_sequence_count()
+        self._n_sequences = 0  # updated externally via updatesequence_count()
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -648,11 +657,13 @@ class WaveformTableWidget(QtWidgets.QWidget):
 
         self._add_empty_rows(10)
 
+        self.csv_path: str = ""
+
     # ------------------------------------------------------------------
     # Sequence count update — called from Widget when sequences change
     # ------------------------------------------------------------------
 
-    def update_sequence_count(self, n):
+    def updatesequence_count(self, n):
         """Update the valid range for sequence IDs and re-validate column 0."""
         self._n_sequences = n
         self._block_cell_signals = True
@@ -819,6 +830,7 @@ class WaveformTableWidget(QtWidgets.QWidget):
                 writer.writerow(["Sequence", "Repetitions"])
                 for seq_id, reps in entries:
                     writer.writerow([seq_id, reps])
+            self.csv_path = path
         except Exception:
             error()
 
@@ -834,33 +846,39 @@ class WaveformTableWidget(QtWidgets.QWidget):
         )
         if not path:
             return
+
         try:
-            rows = []
-            with open(path, newline='') as f:
-                for row in csv.reader(f):
-                    if len(row) < 2:
-                        continue
-                    try:
-                        seq_id = int(row[0].strip())
-                        reps   = int(row[1].strip())
-                        if seq_id >= 1 and reps >= 1:
-                            rows.append((seq_id, reps))
-                    except ValueError:
-                        continue  # skip header or non-integer lines
-            if not rows:
-                return
-            self.table.setRowCount(0)
-            self._block_cell_signals = True
-            for seq_id, reps in rows:
-                r = self.table.rowCount()
-                self.table.insertRow(r)
-                self.table.setItem(r, 0, QtWidgets.QTableWidgetItem("%d" % seq_id))
-                self.table.setItem(r, 1, QtWidgets.QTableWidgetItem("%d" % reps))
-            self._block_cell_signals = False
-            self._ensure_trailing_empty_row()
-            self._emit_waveform_changed()
+            self.load_csv(path)
         except Exception:
             error()
+
+    def load_csv(self, path: str) -> None:
+        """Load waveform data from a CSV file at the given path, replacing the table contents."""
+        rows = []
+        with open(path, newline='') as f:
+            for row in csv.reader(f):
+                if len(row) < 2:
+                    continue
+                try:
+                    seq_id = int(row[0].strip())
+                    reps = int(row[1].strip())
+                    if seq_id >= 1 and reps >= 1:
+                        rows.append((seq_id, reps))
+                except ValueError:
+                    continue  # skip header or non-integer lines
+        if not rows:
+            return
+        self.table.setRowCount(0)
+        self._block_cell_signals = True
+        for seq_id, reps in rows:
+            r = self.table.rowCount()
+            self.table.insertRow(r)
+            self.table.setItem(r, 0, QtWidgets.QTableWidgetItem("%d" % seq_id))
+            self.table.setItem(r, 1, QtWidgets.QTableWidgetItem("%d" % reps))
+        self._block_cell_signals = False
+        self._ensure_trailing_empty_row()
+        self._emit_waveform_changed()
+        self.csv_path = path
 
     def clear_data(self):
         self.table.setRowCount(0)

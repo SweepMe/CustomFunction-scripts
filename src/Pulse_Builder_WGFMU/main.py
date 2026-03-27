@@ -82,6 +82,7 @@ class WGFMUTableWidget(TableWidget):
         self._me_btn_clear.clicked.connect(self._me_clear)
 
         self._me_add_empty_rows(5)
+        self.csv_path: str = ""
 
     # ------------------------------------------------------------------
     # Override: first row's time increment must be 0 (WGFMU constraint)
@@ -302,6 +303,10 @@ class WGFMUTableWidget(TableWidget):
         )
         if not path:
             return
+        self.load_csv(path)
+
+    def load_csv(self, path) -> None:
+        """Load measure events and waveform data from a combined CSV file."""
         try:
             me_rows     = []
             wf_rows     = []
@@ -363,6 +368,8 @@ class WGFMUTableWidget(TableWidget):
 
         except Exception:
             error()
+        else:
+            self.csv_path = path
 
 
 # ---------------------------------------------------------------------------
@@ -372,8 +379,8 @@ class WGFMUTableWidget(TableWidget):
 class WGFMUSequenceTabWidget(SequenceTabWidget):
     """SequenceTabWidget that instantiates WGFMUTableWidget instead of TableWidget."""
 
-    def _add_sequence_tab(self):
-        seq_idx = self._sequence_count()
+    def add_sequence_tab(self):
+        seq_idx = self.sequence_count()
         table   = WGFMUTableWidget()
         table.data_changed.connect(self._on_any_data_changed)
 
@@ -418,6 +425,45 @@ class WGFMUWidget(Widget):
         grid.addWidget(v_splitter, 0, 0)
         return grid
 
+    def get_setting(self) -> list[str]:
+        """Return a string representation of the current pulse definition csv file paths."""
+        csv_paths = []
+        for i in range(self.sequence_tabs.count()):
+            widget = self.sequence_tabs.widget(i)
+            if isinstance(widget, WGFMUTableWidget):
+                csv_paths.append(f"sequence_{i+1}: {widget.csv_path}")  # use 1-based indexing for user-readable format
+
+        # add the waveform table csv path if it exists
+        if self.waveform_table and hasattr(self.waveform_table, 'csv_path'):
+            csv_paths.append(f"waveform_table: {self.waveform_table.csv_path}")
+        return csv_paths
+
+    def set_setting(self, setting: list[str]) -> None:
+        """Parse the setting string to extract csv file paths and load them into the respective tables."""
+        for line in setting:
+            if line.startswith("sequence_"):
+                try:
+                    key, path = line.split(":", 1)
+                    idx = int(key.split("_")[1])
+                    path = path.strip()
+                    if path:
+                        # if the tab does not exist yet, add it
+                        while idx > self.sequence_tabs.sequence_count():
+                            self.sequence_tabs.add_sequence_tab()
+
+                        widget = self.sequence_tabs.widget(idx - 1)  # convert to 0-based index
+                        if isinstance(widget, WGFMUTableWidget):
+                            widget.load_csv(path)
+                except (IndexError, ValueError):
+                    continue
+            elif line.startswith("waveform_table:"):
+                try:
+                    _, path = line.split(":", 1)
+                    path = path.strip()
+                    if path:
+                        self.waveform_table.load_csv(path)
+                except ValueError:
+                    continue
 
 # ---------------------------------------------------------------------------
 # SweepMe! CustomFunction entry point
@@ -447,6 +493,14 @@ class Main():
             self.widget = widget
 
         return self.widget
+
+    def get_setting(self) -> list[str]:
+        """Return the csv save paths as list[str], if they exist."""
+        return self.widget.get_setting()
+
+    def set_setting(self, setting: list[str]) -> None:
+        """Receive the csv save paths as strings and load them into the respective tables."""
+        self.widget.set_setting(setting)
 
     def initialize(self):
         """Load the DLL, open a session, and connect to the channel.
@@ -485,7 +539,7 @@ class Main():
         """
         wgfmu.clear()
 
-        n_seqs = self.widget.sequence_tabs._sequence_count()
+        n_seqs = self.widget.sequence_tabs.sequence_count()
         self.measure_events = []
         for i in range(n_seqs):
             tab = self.widget.sequence_tabs.widget(i)
@@ -502,7 +556,6 @@ class Main():
             pattern_name = f"pattern_{i}"
             wgfmu.create_pattern(pattern_name, voltages[0])
             if len(increments) > 1:
-                # print(f"Pattern {pattern_name} with {increments[1:]} s increments and {voltages[1:]} V voltages")
                 wgfmu.add_vector_array(pattern_name, increments[1:], voltages[1:])
 
             for j, (start, points, interval) in enumerate(tab.get_measure_events()):
@@ -526,7 +579,6 @@ class Main():
 
     def measure(self) -> None:
         """Perform the measurement."""
-        print("Starting measurement...")
         wgfmu.execute()
         time.sleep(1)
         # TODO: wait for the status to be RUNNING
@@ -538,7 +590,6 @@ class Main():
                 break
 
             status, elapsed_time, estimated_total_time = wgfmu.get_channel_status(self.channel_id)
-            # print(f"Status: {status}, Elapsed time: {elapsed_time:.2f}s, Estimated total time: {estimated_total_time:.2f}s")
             if status != wgfmu.ChannelStatus.RUNNING:
                 break
 
@@ -555,7 +606,6 @@ class Main():
             return
 
         completed_points, total_points = wgfmu.get_measure_value_size(self.channel_id)
-        print(f"Completed measure points: {completed_points}, Total measure points: {total_points}")
         if completed_points < 1:
             msg = "No measurement points completed. Cannot read results."
             raise RuntimeError(msg)
