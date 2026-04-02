@@ -3,10 +3,14 @@
 # company/institute:
 
 import csv
+from typing import Any
+
 from PySide2 import QtWidgets, QtGui, QtCore
 
 import time
 
+from pysweepme.EmptyDeviceClass import EmptyDevice
+from pysweepme.ErrorMessage import error
 from pysweepme import FolderManager
 FolderManager.addFolderToPATH()
 
@@ -22,7 +26,7 @@ from pulse_builder import (
     _color_icon,
     _sequence_color,
 )
-from pysweepme.ErrorMessage import error
+
 
 
 # ---------------------------------------------------------------------------
@@ -483,6 +487,21 @@ class Main():
     }
     execution = "process"
 
+    def __init__(self) -> None:
+        """Define instance attributes that will be used across the measurement lifecycle."""
+        self.widget = None
+
+        self.measure_mode: str = ""
+        self.measure_average: float = 1
+        self.channel: int = -1
+        self.device_communication: dict[str, Any] = {}
+        self.device_communication_key: str = ""
+        self.is_master: bool = False
+
+        self.is_run_stopped = lambda: False  # will be overridden by SweepMe! with a function that returns True when the measurement run is stopped
+        self.measured_timestamps: list[float] = []
+        self.measured_voltages: list[float] = []
+
     def renew_widget(self, widget=None):
         """Gets the widget from the module and returns the same or creates a new one.
         Called in the main GUI thread."""
@@ -502,7 +521,7 @@ class Main():
         """Receive the csv save paths as strings and load them into the respective tables."""
         self.widget.set_setting(setting)
 
-    def initialize(self):
+    def connect(self):
         """Load the DLL, open a session, and connect to the channel.
 
         self.main_arguments is available here before the first main() call.
@@ -514,21 +533,36 @@ class Main():
         channel              = int(self.main_arguments["Channel"])
         self.measure_mode    = self.main_arguments["Measure mode"]
         self.measure_average = float(self.main_arguments["Measure event average in s"])
-        self.channel_id      = wgfmu.create_channel_id(slot, channel)
+        self.channel      = wgfmu.create_channel_id(slot, channel)
 
         # Reflect measurement type in the output unit column
         self.units = ["s", "V" if "voltage" in self.measure_mode.lower() else "A"]
 
-        wgfmu.load_dll()
-        wgfmu.open_session(address)
-        wgfmu.initialize()
-        wgfmu.clear()  # clear any previous state (patterns, sequences, etc.)
-        wgfmu.connect(self.channel_id)
+        # If multiple channels are used by instantiating multiple CFS or Signal driver instances, a master channel
+        # can be defined by using the device_communication dict of EmptyDeviceClass
+        # TODO: after update to pysweepme, use get_device_communication()
+        self.device_communication = EmptyDevice._device_communication
+        # The key must mirror the definition in Signal-Keysight_B1500-WGFMU
+        self.device_communication_key = f"Signal_Keysight_B1500-WGFMU_{address}"
+
+        if self.device_communication_key not in self.device_communication:
+            # First instance, load the dll and connect to the device
+            wgfmu.load_dll()
+
+            wgfmu.open_session(address)
+            wgfmu.initialize()
+            wgfmu.clear()  # clear any previous waveforms and sequences
+            self.device_communication[self.device_communication_key] = -1  # will be set to master channel in configure
+
+        # Independent of whether this is the first instance or not, connect to the channel
+        wgfmu.connect(self.channel)
 
     def deinitialize(self):
         """Disconnect the channel and close the WGFMU session."""
-        wgfmu.disconnect(self.channel_id)
-        wgfmu.close_session()
+        wgfmu.disconnect(self.channel)
+        if self.device_communication_key in self.device_communication:
+            wgfmu.close_session()
+            del self.device_communication[self.device_communication_key]
 
     def configure(self):
         """Upload patterns and sequences from the widget to the hardware.
@@ -553,7 +587,7 @@ class Main():
                     f"(got {increments[0]})."
                 )
 
-            pattern_name = f"pattern_{i}"
+            pattern_name = f"sweepme_pattern_{self.channel}_{i}"
             wgfmu.create_pattern(pattern_name, voltages[0])
             if len(increments) > 1:
                 wgfmu.add_vector_array(pattern_name, increments[1:], voltages[1:])
@@ -571,25 +605,37 @@ class Main():
                 )
 
         for seq_id, reps in self.widget.waveform_table.get_waveform_data():
-            wgfmu.add_sequence(self.channel_id, f"pattern_{seq_id - 1}", reps)
+            wgfmu.add_sequence(self.channel, f"sweepme_pattern_{self.channel}_{seq_id - 1}", reps)
 
-        wgfmu.set_operation_mode(self.channel_id, wgfmu.OperationMode.FASTIV)
+        wgfmu.set_operation_mode(self.channel, wgfmu.OperationMode.FASTIV)
         measure_mode = "Voltage" if "voltage" in self.measure_mode.lower() else "Current"
-        wgfmu.set_measure_mode(self.channel_id, measure_mode)
+        wgfmu.set_measure_mode(self.channel, measure_mode)
 
     def measure(self) -> None:
         """Perform the measurement."""
-        wgfmu.execute()
-        time.sleep(1)
-        # TODO: wait for the status to be RUNNING
+        master_channel = self.device_communication[self.device_communication_key]
+        if master_channel < 0:  # no master channel set yet
+            self.is_master = True
+            self.device_communication[self.device_communication_key] = self.channel
+        elif master_channel == self.channel:
+            self.is_master = True
+        else:
+            self.is_master = False
+
+        if self.is_master:
+            wgfmu.execute()
+            # ensure the measurement is started by waiting for the running state (max 3s)
+            start_time = time.time()
+            while not self.is_run_stopped() and time.time() - start_time < 3:
+                status, _, _ = wgfmu.get_channel_status(self.channel)
+                if status == wgfmu.ChannelStatus.RUNNING:
+                    break
+                time.sleep(0.1)
 
     def request_result(self) -> None:
         """Each channel waits until its status is not 'RUNNING'."""
-        while True:
-            if self.is_run_stopped():
-                break
-
-            status, elapsed_time, estimated_total_time = wgfmu.get_channel_status(self.channel_id)
+        while not self.is_run_stopped():
+            status, elapsed_time, estimated_total_time = wgfmu.get_channel_status(self.channel)
             if status != wgfmu.ChannelStatus.RUNNING:
                 break
 
@@ -605,32 +651,13 @@ class Main():
             # No measurement events defined, so no results to read
             return
 
-        completed_points, total_points = wgfmu.get_measure_value_size(self.channel_id)
+        completed_points, total_points = wgfmu.get_measure_value_size(self.channel)
         if completed_points < 1:
             msg = "No measurement points completed. Cannot read results."
             raise RuntimeError(msg)
-        self.measured_timestamps, self.measured_voltages = wgfmu.get_measure_values(self.channel_id, 0, completed_points)
+        self.measured_timestamps, self.measured_voltages = wgfmu.get_measure_values(self.channel, 0, completed_points)
 
     def main(self, **kwargs):
         """Execute the waveform, wait for completion, and return measured data."""
-        # wgfmu.execute()
-        #
-        # while True:
-        #     status, elapsed, estimated = wgfmu.get_channel_status(self.channel_id)
-        #     if status != wgfmu.ChannelStatus.RUNNING:
-        #         break
-        #     if estimated > 0 and elapsed > 2 * estimated:
-        #         raise RuntimeError(
-        #             f"Measurement timeout "
-        #             f"(elapsed {elapsed:.2f} s, estimated {estimated:.2f} s)."
-        #         )
-        #     time.sleep(0.05)
-        #
-        # completed, _total = wgfmu.get_measure_value_size(self.channel_id)
-        # if completed < 1:
-        #     return [], []
-
-        # timestamps, values = wgfmu.get_measure_values(self.channel_id, 0, completed)
-
         # TODO: add execution = 'call'
         return self.measured_timestamps, self.measured_voltages
