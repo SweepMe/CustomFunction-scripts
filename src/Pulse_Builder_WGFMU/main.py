@@ -915,7 +915,7 @@ class Main():
         Reads sequence tabs (time increments, voltages, measure events, range events) and
         the waveform table (playback order + repetitions).
         """
-        wgfmu.clear()
+        #wgfmu.clear()  # might delete unwanted sequences
 
         is_current_mode = "current" in self.measure_mode.lower()
         n_seqs = self.widget.sequence_tabs.sequence_count()
@@ -960,7 +960,8 @@ class Main():
                     )
 
         for seq_id, reps in self.widget.waveform_table.get_waveform_data():
-            wgfmu.add_sequence(self.channel, f"sweepme_pattern_{self.channel}_{seq_id - 1}", reps)
+            pattern_name = f"sweepme_pattern_{self.channel}_{seq_id - 1}"
+            wgfmu.add_sequence(self.channel, pattern_name, reps)
 
         wgfmu.set_operation_mode(self.channel, wgfmu.OperationMode.FASTIV)
         measure_mode = "Voltage" if "voltage" in self.measure_mode.lower() else "Current"
@@ -981,9 +982,10 @@ class Main():
             wgfmu.execute()
             # ensure the measurement is started by waiting for the running state (max 3s)
             start_time = time.time()
+
             while not self.is_run_stopped() and time.time() - start_time < 3:
                 status, _, _ = wgfmu.get_channel_status(self.channel)
-                if status == wgfmu.ChannelStatus.RUNNING:
+                if status in (wgfmu.ChannelStatus.RUNNING, wgfmu.ChannelStatus.COMPLETED):
                     break
                 time.sleep(0.1)
 
