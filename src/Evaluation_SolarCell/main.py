@@ -34,7 +34,7 @@ class Main():
     </p>
     """
 
-    variables = ["I_sc", "V_oc", "P_mpp", "V_mpp", "I_mpp", "FF", "sat", "Id_mpp", "sat_ph"]
+    variables = ["I_sc", "V_oc", "P_mpp", "V_mpp", "I_mpp", "FF", "Sat", "Id_mpp", "Sat_ph"]
     units = ["A", "V", "W", "V", "A", "", "", "A", ""]
 
     arguments = {
@@ -117,7 +117,7 @@ class Main():
                 Id_mpp = np.interp(V_mpp, V_dark, I_dark)
 
             # sat_ph: photocurrent saturation at most-negative voltage
-            if V_dark_lo <= V_min <= V_dark_hi:
+            if V_dark_lo <= V_dark_hi:  # check if sweep direction is positive
                 I_dark_at_V_min = np.interp(V_min, V_dark, I_dark)
                 sat_ph = (I_at_V_min - I_dark_at_V_min) / I_sc
 
