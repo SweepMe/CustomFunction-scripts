@@ -35,7 +35,7 @@ class Main():
     """
 
     variables = ["I_sc", "V_oc", "P_mpp", "V_mpp", "I_mpp", "FF", "Sat", "Id_mpp", "Sat_ph"]
-    units = ["A", "V", "W", "V", "A", "", "", "A", ""]
+    units = ["mA", "V", "mW", "V", "mA", "%", "", "mA", ""]
 
     arguments = {
         "I_light": (),
@@ -73,7 +73,7 @@ class Main():
         if V[0] > 0 or V[-1] < 0:
             return nan_result
 
-        I_sc = np.interp(0.0, V, I)
+        I_sc = np.interp(0.0, V, I) * 1000  # convert to mA
         if I_sc == 0:
             return [I_sc, nan, nan, nan, nan, nan, nan, nan, nan]
 
@@ -95,14 +95,14 @@ class Main():
                 P_quad = np.abs(V[mask] * I[mask])
                 idx_mpp = int(np.argmax(P_quad))
                 V_mpp = V[mask][idx_mpp]
-                I_mpp = I[mask][idx_mpp]
-                P_mpp = P_quad[idx_mpp]
-                FF = P_mpp / (np.abs(I_sc) * np.abs(V_oc))
+                I_mpp = I[mask][idx_mpp] * 1000  # convert to mA
+                P_mpp = P_quad[idx_mpp] * 1000  # convert to mW
+                FF = P_mpp / (np.abs(I_sc) * np.abs(V_oc)) * 100  # convert to %
 
         # Saturation: current at most-negative voltage / I_sc
         I_at_V_min = I[0]
         V_min = V[0]
-        sat = I_at_V_min / I_sc
+        sat = I_at_V_min / I_sc * 1000  # I_min in A and I_sc in mA
 
         # Dark-dependent outputs
         Id_mpp = nan
@@ -114,12 +114,12 @@ class Main():
 
             # Id_mpp: dark current at V_mpp
             if not np.isnan(V_mpp) and V_dark_lo <= V_mpp <= V_dark_hi:
-                Id_mpp = np.interp(V_mpp, V_dark, I_dark)
+                Id_mpp = np.interp(V_mpp, V_dark, I_dark) * 1000  # convert to mA
 
             # sat_ph: photocurrent saturation at most-negative voltage
             if V_dark_lo <= V_dark_hi:  # check if sweep direction is positive
                 I_dark_at_V_min = np.interp(V_min, V_dark, I_dark)
-                sat_ph = (I_at_V_min - I_dark_at_V_min) / I_sc
+                sat_ph = (I_at_V_min - I_dark_at_V_min) / I_sc * 1000  # I_min in A and I_sc in mA
 
         return [I_sc, V_oc, P_mpp, V_mpp, I_mpp, FF, sat, Id_mpp, sat_ph]
 
