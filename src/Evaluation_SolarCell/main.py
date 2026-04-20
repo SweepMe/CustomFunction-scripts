@@ -117,7 +117,7 @@ class Main():
                 Id_mpp = np.interp(V_mpp, V_dark, I_dark) * 1000  # convert to mA
 
             # sat_ph: photocurrent saturation at most-negative voltage
-            if V_dark_lo <= V_dark_hi:  # check if sweep direction is positive
+            if V_dark_lo <= V_min <= V_dark_hi:
                 I_dark_at_V_min = np.interp(V_min, V_dark, I_dark)
                 sat_ph = (I_at_V_min - I_dark_at_V_min) / I_sc * 1000  # I_min in A and I_sc in mA
 
