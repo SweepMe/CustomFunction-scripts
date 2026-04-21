@@ -175,5 +175,5 @@ if __name__ == "__main__":
         I_light=I_light, V_light=V_light,
         I_dark=I_dark_narrow, V_dark=V_dark_narrow,
     )
-    print(f"  sat_ph: {results2[8]}")  # should be nan
-    print(f"  Id_mpp: {results2[7]:.4g} A")  # should be a valid number
+    print(f"  sat_ph: {results2[9]}")  # should be nan
+    print(f"  Id_mpp: {results2[8]:.4g} mA")  # should be a valid number
