@@ -7,39 +7,52 @@ import numpy as np
 class Main():
 
     """
-    <h2>Solar Cell IV Curve Analysis</h2>
-    <p>
-    Extracts photovoltaic figures of merit from an illuminated IV curve measured by one SMU.
-    Optionally a dark IV curve (from the same SMU) can be provided to compute additional
-    parameters. The dark curve may have different voltage points than the light curve;
-    interpolation is used where needed.
-    </p>
-    <h3>Outputs</h3>
-    <ul>
-    <li><b>I_sc</b>: Short-circuit current — interpolated at V = 0</li>
-    <li><b>V_oc</b>: Open-circuit voltage — interpolated at I = 0</li>
-    <li><b>P_mpp</b>: Maximum output power |V &times; I| in the power-generating quadrant</li>
-    <li><b>V_mpp</b>: Voltage at the maximum power point</li>
-    <li><b>I_mpp</b>: Current at the maximum power point</li>
-    <li><b>FF</b>: Fill factor = P_mpp / (|I_sc| &times; |V_oc|)</li>
-    <li><b>sat</b>: Saturation = I_light at most-negative voltage / I_sc</li>
-    <li><b>Id_mpp</b>: Dark current interpolated at V_mpp (nan if no dark data or V_mpp
-        outside dark voltage range)</li>
-    <li><b>sat_ph</b>: Photocurrent saturation = (I_light &minus; I_dark) at most-negative
-        voltage / I_sc (nan if no dark data or voltage outside dark range)</li>
-    </ul>
-    <p>
-    Both sign conventions are supported (I_sc positive or negative). Leave I_dark and V_dark
-    unconnected if no dark measurement is available.
-    </p>
+<h2>Solar Cell IV Curve Analysis</h2>
+<p>
+Extracts photovoltaic figures of merit from an illuminated IV curve measured by one SMU.
+Optionally a dark IV curve (from the same SMU) can be provided to compute additional
+parameters. The dark curve may have different voltage points than the light curve;
+interpolation is used where needed.
+</p>
+<h3>Inputs</h3>
+<ul>
+<li><b>I_light</b>: Illuminated current data</li>
+<li><b>V_light</b>: Illuminated voltage data</li>
+<li><b>Illumination in W/m²</b>: Illumination intensity</li>
+<li><b>Illuminated Area in cm²</b>: Illuminated area of the solar cell</li>
+<li><b>I_dark</b>: Dark current data (optional)</li>
+<li><b>V_dark</b>: Dark voltage data (optional)</li>
+</ul>
+<h3>Outputs</h3>
+<ul>
+<li><b>I_sc</b>: Short-circuit current — interpolated at V = 0</li>
+<li><b>V_oc</b>: Open-circuit voltage — interpolated at I = 0</li>
+<li><b>P_mpp</b>: Maximum output power |V &times; I| in the power-generating quadrant</li>
+<li><b>Efficiency</b>: Efficiency = P_mpp / (Illumination &times; Area) &times; 100%</li>
+<li><b>V_mpp</b>: Voltage at the maximum power point</li>
+<li><b>I_mpp</b>: Current at the maximum power point</li>
+<li><b>FF</b>: Fill factor = P_mpp / (|I_sc| &times; |V_oc|)</li>
+<li><b>sat</b>: Saturation = I_light at most-negative voltage / I_sc</li>
+<li><b>Id_mpp</b>: Dark current interpolated at V_mpp (nan if no dark data or V_mpp
+    outside dark voltage range)</li>
+<li><b>sat_ph</b>: Photocurrent saturation = (I_light &minus; I_dark) at most-negative
+    voltage / I_sc (nan if no dark data or voltage outside dark range)</li>
+</ul>
+<p>
+Both sign conventions are supported (I_sc positive or negative). Leave I_dark and V_dark
+unconnected if no dark measurement is available.
+</p>
+
     """
 
-    variables = ["I_sc", "V_oc", "P_mpp", "V_mpp", "I_mpp", "FF", "Sat", "Id_mpp", "Sat_ph"]
-    units = ["mA", "V", "mW", "V", "mA", "%", "", "mA", ""]
+    variables = ["I_sc", "V_oc", "P_mpp", "Efficiency", "V_mpp", "I_mpp", "FF", "Sat", "Id_mpp", "Sat_ph"]
+    units = ["mA", "V", "mW", "%", "V", "mA", "%", "", "mA", ""]
 
     arguments = {
         "I_light": (),
         "V_light": (),
+        "Illumination in W/m²": (),
+        "Illuminated Area in cm²": (),
         "I_dark": (),
         "V_dark": (),
     }
@@ -48,11 +61,13 @@ class Main():
 
         I_light = np.array(kwargs["I_light"], dtype=float)
         V_light = np.array(kwargs["V_light"], dtype=float)
+        illu = float(kwargs["Illumination in W/m²"]) if kwargs["Illumination in W/m²"] else float('nan')
+        area = float(kwargs["Illuminated Area in cm²"]) if kwargs["Illuminated Area in cm²"] else float('nan')
         I_dark_raw = np.array(kwargs["I_dark"], dtype=float)
         V_dark_raw = np.array(kwargs["V_dark"], dtype=float)
 
         nan = float("nan")
-        nan_result = [nan] * 9
+        nan_result = [nan] * 10
 
         if len(I_light) < 2 or len(V_light) < 2:
             return nan_result
@@ -75,7 +90,7 @@ class Main():
 
         I_sc = np.interp(0.0, V, I) * 1000  # convert to mA
         if I_sc == 0:
-            return [I_sc, nan, nan, nan, nan, nan, nan, nan, nan]
+            return [I_sc, nan, nan, nan, nan, nan, nan, nan, nan, nan]
 
         # V_oc: linear interpolation across first zero crossing of I
         sign_changes = np.where(np.diff(np.sign(I)))[0]
@@ -87,7 +102,7 @@ class Main():
             V_oc = V[i] + (V[i + 1] - V[i]) * (-I[i]) / dI if dI != 0 else nan
 
         # Power-generating quadrant and MPP
-        P_mpp, V_mpp, I_mpp, FF = nan, nan, nan, nan
+        P_mpp, eff, V_mpp, I_mpp, FF = nan, nan, nan, nan, nan
         if not np.isnan(V_oc):
             # Power quadrant: V between 0 and V_oc, current opposite sign to V_oc
             mask = (V * np.sign(V_oc) > 0) & (I * np.sign(I_sc) > 0)
@@ -97,6 +112,7 @@ class Main():
                 V_mpp = V[mask][idx_mpp]
                 I_mpp = I[mask][idx_mpp] * 1000  # convert to mA
                 P_mpp = P_quad[idx_mpp] * 1000  # convert to mW
+                eff = P_mpp / illu / area * 10 * 100  # convert (1 W / 1000 mW / 1 m² * 10,000 cm²) * 100%
                 FF = P_mpp / (np.abs(I_sc) * np.abs(V_oc)) * 100  # convert to %
 
         # Saturation: current at most-negative voltage / I_sc
@@ -121,7 +137,7 @@ class Main():
                 I_dark_at_V_min = np.interp(V_min, V_dark, I_dark)
                 sat_ph = (I_at_V_min - I_dark_at_V_min) / I_sc * 1000  # I_min in A and I_sc in mA
 
-        return [I_sc, V_oc, P_mpp, V_mpp, I_mpp, FF, sat, Id_mpp, sat_ph]
+        return [I_sc, V_oc, P_mpp, eff, V_mpp, I_mpp, FF, sat, Id_mpp, sat_ph]
 
 
 if __name__ == "__main__":
