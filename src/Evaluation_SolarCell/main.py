@@ -112,7 +112,7 @@ unconnected if no dark measurement is available.
                 V_mpp = V[mask][idx_mpp]
                 I_mpp = I[mask][idx_mpp] * 1000  # convert to mA
                 P_mpp = P_quad[idx_mpp] * 1000  # convert to mW
-                eff = P_mpp / illu / area * 10 * 100  # convert (1 W / 1000 mW / 1 m² * 10,000 cm²) * 100%
+                eff = P_mpp / (illu * area) * 1000 if illu and area else nan
                 FF = P_mpp / (np.abs(I_sc) * np.abs(V_oc)) * 100  # convert to %
 
         # Saturation: current at most-negative voltage / I_sc
