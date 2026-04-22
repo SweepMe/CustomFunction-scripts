@@ -291,8 +291,31 @@ class WGFMUTableWidget(TableWidget):
                 item.setBackground(QtGui.QBrush())
         self._me_block = False
 
+        # Cross-validate averaging vs interval: averaging must not exceed interval,
+        # otherwise the WGFMU rejects the measurement event.
+        if column in (2, 3):
+            self._me_validate_avg_vs_interval(row)
+
         self._me_ensure_trailing_empty_row()
         self.events_changed.emit()
+
+    def _me_validate_avg_vs_interval(self, row):
+        """Mark the averaging cell red if it exceeds the interval cell in the same row."""
+        it_ivl = self._me_table.item(row, 2)
+        it_avg = self._me_table.item(row, 3)
+        if it_ivl is None or it_avg is None:
+            return
+        ivl_text = it_ivl.text().strip()
+        avg_text = it_avg.text().strip()
+        if not ivl_text or not avg_text:
+            return
+        try:
+            ivl = float(ivl_text)
+            avg = float(avg_text)
+        except ValueError:
+            return
+        if avg > ivl:
+            it_avg.setBackground(self._COLOR_INVALID)
 
     # ------------------------------------------------------------------
     # Measure events — public API
@@ -479,6 +502,10 @@ class WGFMUTableWidget(TableWidget):
                     writer.writerow(["%1.6g" % x, "%1.6g" % y])
         except Exception:
             error()
+        else:
+            # Persist the saved path so the setting file round-trips correctly
+            # (otherwise get_setting would still see the previous path).
+            self.csv_path = path
 
     # ------------------------------------------------------------------
     # Combined CSV — load
@@ -596,7 +623,14 @@ class WGFMUTableWidget(TableWidget):
                     self.table.setItem(r, 1, QtWidgets.QTableWidgetItem("%1.6g" % y))
                 self._block_cell_signals = False
                 self._ensure_trailing_empty_row()
-                self._emit_data_changed()
+
+            # Always notify listeners so the sequence plot and event overlays refresh,
+            # even when the CSV contained only events (no waveform rows) or only
+            # waveform rows (no events). Without these, the first loaded sequence can
+            # end up with stale/empty overlays because the plot is only updated via
+            # data_changed / events_changed.
+            self._emit_data_changed()
+            self.events_changed.emit()
 
         except Exception:
             error()
@@ -616,6 +650,12 @@ class WGFMUPlotWidget(PlotWidget):
         self._me_events_per_seq: list = []  # list[list[(start, points, interval, avg)]]
         self._re_events_per_seq: list = []  # list[list[(start_time, range_enum)]]
         self._event_artists: list = []      # all overlay matplotlib artists
+        self._selected_seq: int = -1        # currently selected tab; -1 means show all
+
+    def set_selected_sequence(self, index: int) -> None:
+        """Restrict event overlays to a single sequence index (-1 for all)."""
+        self._selected_seq = index
+        self._redraw_event_overlays()
 
     def set_segments(self, segments):
         """Redraw sequence lines then refresh overlays."""
@@ -652,18 +692,23 @@ class WGFMUPlotWidget(PlotWidget):
         self._event_artists = []
 
         # Measurement event spans — shaded region per event, color-matched to sequence.
-        # interval is the total measurement window; points are distributed within it.
+        # Only overlays for the currently selected sequence are drawn, to keep the
+        # plot readable when multiple sequences have overlapping events.
         for i, events in enumerate(self._me_events_per_seq):
+            if self._selected_seq != -1 and i != self._selected_seq:
+                continue
             color = _sequence_color(i)
-            for start, _points, interval, _avg in events:
+            for start, points, interval, _avg in events:
                 span = ax.axvspan(
-                    start, start + interval,
+                    start, start + points * interval,
                     alpha=0.15, color=color, linewidth=0,
                 )
                 self._event_artists.append(span)
 
         # Range event markers — vertical dashed line + label at top of axes
         for _i, events in enumerate(self._re_events_per_seq):
+            if self._selected_seq != -1 and _i != self._selected_seq:
+                continue
             for start_time, range_enum in events:
                 line = ax.axvline(
                     start_time, color='gray', linestyle='--', linewidth=1, alpha=0.7,
@@ -681,6 +726,11 @@ class WGFMUPlotWidget(PlotWidget):
                 self._event_artists.append(text)
 
         try:
+            # Recompute data limits so that shrinking an event span actually
+            # pulls the x-axis back in (axvspan contributes to the data limits,
+            # so without this the axes stay stretched to the old, wider span).
+            ax.relim()
+            ax.autoscale_view()
             self.seq_canvas.draw()
         except Exception:
             pass
@@ -740,6 +790,15 @@ class WGFMUWidget(Widget):
         super().__init__()
         # Connect the events signal that WGFMUSequenceTabWidget provides
         self.sequence_tabs.sequence_events_changed.connect(self._on_sequence_events_changed)
+        # Only overlay the currently selected sequence's events to avoid clutter.
+        self.sequence_tabs.currentChanged.connect(self._on_sequence_tab_changed)
+        self.plot_widget.set_selected_sequence(self.sequence_tabs.currentIndex())
+
+    def _on_sequence_tab_changed(self, index: int) -> None:
+        # The trailing "+" tab is not a sequence tab; ignore it.
+        if index < 0 or index >= self.sequence_tabs.sequence_count():
+            return
+        self.plot_widget.set_selected_sequence(index)
 
     def _on_sequences_changed(self, sequences):
         """Override to also refresh event overlays whenever sequence data changes."""
@@ -937,7 +996,30 @@ class Main():
             if len(increments) > 1:
                 wgfmu.add_vector_array(pattern_name, increments[1:], voltages[1:])
 
-            for j, (start, points, interval, average) in enumerate(tab.get_measure_events()):
+            # Validate measure events: each event's window (points * interval) must
+            # fit within the sequence duration, and events must not overlap — otherwise
+            # the WGFMU silently refuses to start or overwrites samples.
+            events = tab.get_measure_events()
+            sequence_duration = sum(increments)
+            for start, points, interval, _avg in events:
+                event_end = start + points * interval
+                if event_end > sequence_duration + 1e-12:
+                    raise ValueError(
+                        f"Sequence {i + 1}: measure event starting at {start:g} s with "
+                        f"{points} points x {interval:g} s interval ends at {event_end:g} s, "
+                        f"which exceeds the sequence duration of {sequence_duration:g} s."
+                    )
+            sorted_events = sorted(events, key=lambda e: e[0])
+            for a, b in zip(sorted_events, sorted_events[1:]):
+                a_end = a[0] + a[1] * a[2]
+                if a_end > b[0] + 1e-12:
+                    raise ValueError(
+                        f"Sequence {i + 1}: measure events overlap — event starting at "
+                        f"{a[0]:g} s ends at {a_end:g} s and overlaps with the event "
+                        f"starting at {b[0]:g} s."
+                    )
+
+            for j, (start, points, interval, average) in enumerate(events):
                 self.measure_events.append((start, points, interval))
                 wgfmu.set_measure_event(
                     pattern_name,
@@ -982,12 +1064,19 @@ class Main():
             wgfmu.execute()
             # ensure the measurement is started by waiting for the running state (max 3s)
             start_time = time.time()
-
+            started = False
             while not self.is_run_stopped() and time.time() - start_time < 3:
                 status, _, _ = wgfmu.get_channel_status(self.channel)
                 if status in (wgfmu.ChannelStatus.RUNNING, wgfmu.ChannelStatus.COMPLETED):
+                    started = True
                     break
                 time.sleep(0.1)
+
+            if not started and not self.is_run_stopped():
+                raise RuntimeError(
+                    "WGFMU measurement did not start within 3 seconds. "
+                    "Check the pattern, sequence, and measure event configuration."
+                )
 
     def request_result(self) -> None:
         """Each channel waits until its status is not 'RUNNING'."""
