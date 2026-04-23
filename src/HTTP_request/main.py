@@ -70,7 +70,7 @@ class Main():
 
         if not success:
 
-            if error_message != "":
+            if error_message:
                 print(f'HTTP request error: {error_message}')
                 
             if response_text != "":    
