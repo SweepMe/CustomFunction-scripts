@@ -73,7 +73,7 @@ class Main():
             if error_message:
                 print(f'HTTP request error: {error_message}')
                 
-            if response_text != "":    
+            if response_text:    
                 print("Last HTTP response:", response_text)
                 
             if stop_on_error:
