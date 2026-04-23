@@ -76,7 +76,7 @@ class Widget(QtWidgets.QWidget):
 
         # Initialize sequence count for waveform table validation
         self._sequences = self.sequence_tabs.get_all_sequences()
-        self.waveform_table.updatesequence_count(len(self._sequences))
+        self.waveform_table.update_sequence_count(len(self._sequences))
 
         # Wire signals
         self.sequence_tabs.sequences_changed.connect(self._on_sequences_changed)
@@ -111,7 +111,7 @@ class Widget(QtWidgets.QWidget):
     def _on_sequences_changed(self, sequences):
         self._sequences = sequences
         self.plot_widget.set_segments(sequences)
-        self.waveform_table.updatesequence_count(len(sequences))
+        self.waveform_table.update_sequence_count(len(sequences))
         self._recompute_waveform()
 
     def _on_waveform_changed(self, entries):
@@ -663,7 +663,7 @@ class WaveformTableWidget(QtWidgets.QWidget):
     # Sequence count update — called from Widget when sequences change
     # ------------------------------------------------------------------
 
-    def updatesequence_count(self, n):
+    def update_sequence_count(self, n):
         """Update the valid range for sequence IDs and re-validate column 0."""
         self._n_sequences = n
         self._block_cell_signals = True

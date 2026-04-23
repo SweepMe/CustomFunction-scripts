@@ -1,6 +1,6 @@
-# author:
-# created at:
-# company/institute:
+# author: Franz Hempel
+# created at: 01.04.2026
+# company/institute: SweepMe!
 
 from pysweepme.ErrorMessage import error
 
