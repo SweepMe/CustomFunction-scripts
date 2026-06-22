@@ -175,6 +175,17 @@ class KXCIPMU:
         """
         return self._query(f":PMU:SOURCE:RANGE {channel}, {voltage_range}")
 
+    def set_load(self, channel: int, load: float) -> str:
+        """``:PMU:LOAD`` - tell the PMU the DUT load resistance for a channel.
+
+        Used by the instrument for load-line correction of the programmed voltage.
+
+        Args:
+            channel: pulse channel, 1-8.
+            load: DUT impedance in ohms, 1.0 to 1e7 (default on the instrument is 1e6).
+        """
+        return self._query(f":PMU:LOAD {channel}, {load}")
+
     def set_sample_rate(self, rate: int) -> str:
         """``:PMU:SAMPLE:RATE`` - set the A/D sample rate in samples/second (1e3 to 200e6).
 
