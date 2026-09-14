@@ -5,7 +5,7 @@
 import csv
 from typing import Any
 
-from PySide2 import QtWidgets, QtGui, QtCore
+from PySide6 import QtWidgets, QtGui, QtCore
 
 import time
 
