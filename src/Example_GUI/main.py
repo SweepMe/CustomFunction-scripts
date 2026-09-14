@@ -6,7 +6,7 @@ from ErrorMessage import error
 import os
 import time
 import datetime
-from PySide2 import QtWidgets, QtGui, QtCore
+from PySide6 import QtWidgets, QtGui, QtCore
 import matplotlib.dates as mdates
 
 # you can import any module that is shipped with SweepMe!, see credits.html
@@ -140,8 +140,8 @@ class Widget(QtWidgets.QWidget):
 
 from matplotlib import pyplot as plt
 
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 
 from matplotlib.figure import Figure
 from matplotlib import rcParams as mplParams
