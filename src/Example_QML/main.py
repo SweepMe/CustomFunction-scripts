@@ -60,7 +60,9 @@ class QmlWidget(QtQuickWidgets.QQuickWidget):
 
         self.counterChanged.connect(self._on_counter_changed)
 
+    @QtCore.Slot(int)
     def _on_counter_changed(self, value: int) -> None:
+        # Decorated as Slot so the queued connection runs it in the widget's (GUI) thread
         root = self.rootObject()
         if root is not None:
             root.setProperty("counter", value)
