@@ -32,7 +32,11 @@ def main(
 
     tempfolder = FoMa.get_path("TEMP")
 
-    images = [Image.open(str(filename)) for filename in Pictures]
+    # copy each frame into memory so that the file is closed again before opening the next one
+    images = []
+    for filename in Pictures:
+        with Image.open(str(filename)) as image:
+            images.append(image.copy())
 
     animation_path = tempfolder + os.sep + "temp_Animation.gif"
 
