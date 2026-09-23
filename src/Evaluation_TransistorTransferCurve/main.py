@@ -46,6 +46,26 @@ class Main():
         nan = float("nan")
         nan_result = [nan] * 5
 
+        # I_D and V_G must be one-dimensional arrays of the same length
+        if I_D.ndim != 1 or I_D.shape != V_G.shape:
+            return nan_result
+
+        # I_G is optional: if not selected, SweepMe! hands over a single None (-> nan) and the current gain is nan
+        if I_G.shape != I_D.shape:
+            if I_G.size == 1 and np.isnan(I_G).all():
+                I_G = np.full_like(I_D, nan)
+            else:
+                return nan_result
+            has_gate_current = False
+        else:
+            has_gate_current = True
+
+        # Drop samples that are not finite, keeping the rows of I_D, V_G and I_G synchronized
+        finite = np.isfinite(I_D) & np.isfinite(V_G)
+        if has_gate_current:
+            finite &= np.isfinite(I_G)
+        I_D, V_G, I_G = I_D[finite], V_G[finite], I_G[finite]
+
         if len(I_D) < 3:
             return nan_result
 
