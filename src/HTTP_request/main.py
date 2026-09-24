@@ -7,8 +7,12 @@ import requests
 # can be used to disable warnings such as missing SSL certificate
 # requests.packages.urllib3.disable_warnings() 
 
-# comes with SweepMe! and simplifies finding the correct path to the certificate
-from WebRequestCerts import CERTFILE
+try:
+    # SweepMe! < 1.6.1: comes with SweepMe! and simplifies finding the correct path to the certificate
+    from WebRequestCerts import CERTFILE
+except ImportError:
+    # SweepMe! >= 1.6.1: requests is patched to use the OS certificate store, so default verification is sufficient
+    CERTFILE = True
 
 
 class Main():
