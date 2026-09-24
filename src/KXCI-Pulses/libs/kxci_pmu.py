@@ -316,6 +316,24 @@ class KXCIPMU:
     # status & data readback
     # ------------------------------------------------------------------ #
 
+    def clear_last_error(self) -> str:
+        """``:ERROR:LAST:CLEAR`` - clear KXCI's last-error buffer.
+
+        Send at the start of a test so that a later :meth:`get_last_error` only reports errors
+        raised by the current test (the buffer otherwise keeps the last error indefinitely).
+        """
+        return self._query(":ERROR:LAST:CLEAR")
+
+    def get_last_error(self) -> str:
+        """``:ERROR:LAST:GET`` - return KXCI's last stored error message (non-destructive).
+
+        Returns e.g. ``"Cannot adjust PMU measure sample rate for SARB configuration. (-951)"``.
+        Essential over ethernet: every command is acknowledged with ``ACK`` on receipt, so
+        configuration errors raised by the final verification of :meth:`execute` never appear in
+        a command response - only on the instrument's KXCI console and in this error buffer.
+        """
+        return self._query(":ERROR:LAST:GET")
+
     def get_test_status(self) -> int:
         """``:PMU:TEST:STATUS?`` - ``STATUS_IDLE`` (0, complete/idle) or ``STATUS_RUNNING`` (1)."""
         return int(self._query(":PMU:TEST:STATUS?"))
