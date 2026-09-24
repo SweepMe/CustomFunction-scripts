@@ -61,8 +61,8 @@ unconnected if no dark measurement is available.
 
         I_light = np.array(kwargs["I_light"], dtype=float)
         V_light = np.array(kwargs["V_light"], dtype=float)
-        illu = float(kwargs["Illumination in W/m²"]) if kwargs["Illumination in W/m²"] else float('nan')
-        area = float(kwargs["Illuminated Area in cm²"]) if kwargs["Illuminated Area in cm²"] else float('nan')
+        illu = self._last_value(kwargs["Illumination in W/m²"])
+        area = self._last_value(kwargs["Illuminated Area in cm²"])
         I_dark_raw = np.array(kwargs["I_dark"], dtype=float)
         V_dark_raw = np.array(kwargs["V_dark"], dtype=float)
 
@@ -138,6 +138,15 @@ unconnected if no dark measurement is available.
                 sat_ph = (I_at_V_min - I_dark_at_V_min) / I_sc * 1000  # I_min in A and I_sc in mA
 
         return [I_sc, V_oc, P_mpp, eff, V_mpp, I_mpp, FF, sat, Id_mpp, sat_ph]
+
+    @staticmethod
+    def _last_value(value) -> float:
+        """Return the last element of a SweepMe! value array as float, nan if not selected or empty.
+
+        numpy >= 2.4 no longer converts 1-element arrays to scalars via float().
+        """
+        values = np.asarray(value, dtype=float).flatten()  # unselected argument np.array([None]) -> [nan]
+        return float(values[-1]) if values.size else float("nan")
 
 
 if __name__ == "__main__":

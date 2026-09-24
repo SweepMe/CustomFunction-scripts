@@ -29,7 +29,7 @@ class Main():
             ): # angry? If you find a bug or need support, please write to support@sweep-me.net
             
             
-        ''' 
+        r''' 
         <h2>Regular expression</h2>
         Search for a sequence of characters in a string using regular expressions<br>
         
