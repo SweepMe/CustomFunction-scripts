@@ -3,10 +3,11 @@
 # company/institute: SweepMe!
 """CustomFunction script: Pulse Builder for the Keithley 4200A-SCS PMU (SegArb via KXCI).
 
-The pulse sequences and their playback order are drawn in the shared Pulse Builder GUI (libs/pulse_builder.py).
-Each sequence tab becomes one SegArb sequence on the instrument, each pair of consecutive points one segment. The
-measure type, start and stop of a segment are set in the row of its first point. The waveform table becomes the
-SegArb sequence list. The captured voltage, current and timestamp are returned as three arrays.
+The pulse sequences are defined segment by segment like in the SegArb dialog of Clarius: each row of a sequence tab
+is one segment with start voltage, stop voltage, segment time, measure enable, optional measure window, SSR and
+trigger output. Each sequence tab becomes one SegArb sequence on the instrument, the waveform table of the shared
+Pulse Builder GUI (libs/pulse_builder.py) becomes the SegArb sequence list. The captured voltage, current and
+timestamp are returned as three arrays.
 """
 from __future__ import annotations
 
@@ -14,7 +15,7 @@ import csv
 import time
 
 import numpy as np
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from pysweepme import FolderManager, Ports
 from pysweepme.ErrorMessage import error
@@ -30,7 +31,6 @@ from pulse_builder import (
     Widget,
     PlotWidget,
     SequenceTabWidget,
-    TableWidget,
     WaveformTableWidget,
     CSV_DEFAULT_DIR,
     _color_icon,
@@ -45,91 +45,112 @@ MAX_SEGMENTS_PER_SEQUENCE = 128  # one :PMU:SARB:SEQ:* call; the ...:ADD variant
 
 START_TIMEOUT_S = 10.0  # max. time between :PMU:EXECUTE and the test reporting RUNNING
 
-# Measure types of :PMU:SARB:SEQ:MEAS:TYPE as shown in the sequence table
+# Measure types of :PMU:SARB:SEQ:MEAS:TYPE, applied to all segments with "Measure" = 1
 MEASURE_TYPES = {
-    "None": KXCIPMU.MEAS_NONE,
     "Waveform discrete": KXCIPMU.MEAS_WAVEFORM_DISCRETE,
     "Waveform average": KXCIPMU.MEAS_WAVEFORM_AVERAGE,
     "Spot mean discrete": KXCIPMU.MEAS_SPOT_MEAN_DISCRETE,
     "Spot mean average": KXCIPMU.MEAS_SPOT_MEAN_AVERAGE,
 }
-DEFAULT_MEASURE_TYPE = "Waveform discrete"
-WAVEFORM_TYPES = {KXCIPMU.MEAS_WAVEFORM_DISCRETE, KXCIPMU.MEAS_WAVEFORM_AVERAGE}
 SPOT_MEAN_TYPES = {KXCIPMU.MEAS_SPOT_MEAN_DISCRETE, KXCIPMU.MEAS_SPOT_MEAN_AVERAGE}
 
-# Sequence table columns
-COL_TIME, COL_VOLTAGE, COL_MEAS_TYPE, COL_MEAS_START, COL_MEAS_STOP = range(5)
-TABLE_HEADERS = ["Time in s", "Voltage in V", "Measure type", "Measure start in s", "Measure stop in s"]
-TABLE_TOOLTIPS = [
-    "Absolute time of the point within the sequence; the first point must be at 0 s",
-    "Voltage of the point",
-    "Measure type of the segment starting at this point (ignored on the last point)",
-    "Measure start relative to the segment start; empty = 0 s",
-    "Measure stop relative to the segment start; empty = end of the segment",
+# Segment table columns, in the order of the Clarius SegArb dialog
+(
+    COL_START_V, COL_STOP_V, COL_TIME, COL_MEASURE, COL_MEAS_START, COL_MEAS_STOP, COL_SSR, COL_TRIGGER,
+) = range(8)
+SEGMENT_HEADERS = [
+    "Start voltage in V", "Stop voltage in V", "Segment time in s", "Measure (0/1)",
+    "Measure start in s", "Measure stop in s", "SSR (0/1)", "Trigger out (0/1)",
 ]
+SEGMENT_TOOLTIPS = [
+    "Voltage at the start of the segment; must equal the stop voltage of the previous segment",
+    "Voltage at the end of the segment",
+    f"Duration of the segment, min. {SEGMENT_TIME_MIN:g} s in steps of {SEGMENT_TIME_RESOLUTION:g} s",
+    "1 = measure this segment with the selected measure type, 0 = no measurement",
+    "Start of the measurement relative to the segment start; empty = 0 s",
+    "Stop of the measurement relative to the segment start; empty = end of the segment",
+    "1 = output relay closed (segment is output), 0 = open (output floating); relay transitions need >= 25 us",
+    "1 = trigger output high during this segment, 0 = low",
+]
+FLAG_COLUMNS = {COL_MEASURE: 1, COL_SSR: 1, COL_TRIGGER: 0}  # column -> default when left empty
 
 
 # ---------------------------------------------------------------------------
-# Waveform conversion: sequence table rows -> SegArb segments
+# Segment rules and conversion to the SegArb arrays
 # ---------------------------------------------------------------------------
 
-def build_segments(sequence_number: int, rows: list[tuple]) -> dict:
-    """Convert the rows of one sequence tab into the SegArb segment arrays.
+def segment_problems(segment: dict, previous_stop_v: float | None) -> list[tuple[int, str]]:
+    """Check one segment against the SegArb rules.
 
-    rows: [(time, voltage, measure_type, measure_start, measure_stop), ...] with absolute times within the sequence
-    (first point at 0 s). Consecutive points give one segment each: its duration is the time difference, its
-    start/stop voltages are the two point voltages - which guarantees the seamless transitions SegArb requires. The
-    measure settings of a segment are taken from its first point; measure_start/stop may be None (= 0 s / segment end).
+    Returns a list of (column, message) - empty if the segment is valid. Used both for highlighting cells in the
+    table and for the checks before a run.
+    """
+    problems = []
+
+    if previous_stop_v is not None and segment["start_v"] != previous_stop_v:
+        problems.append((COL_START_V, (
+            f"start voltage {segment['start_v']:g} V differs from the stop voltage {previous_stop_v:g} V of the "
+            f"previous segment; SegArb transitions must be seamless."
+        )))
+
+    duration = segment["time"]
+    steps = round(duration / SEGMENT_TIME_RESOLUTION)
+    if steps * SEGMENT_TIME_RESOLUTION < SEGMENT_TIME_MIN - 1e-15:
+        problems.append((COL_TIME, f"segment time {duration:g} s is below the minimum of {SEGMENT_TIME_MIN:g} s."))
+    elif abs(duration / SEGMENT_TIME_RESOLUTION - steps) > 1e-3:
+        problems.append((COL_TIME, f"segment time {duration:g} s is not a multiple of {SEGMENT_TIME_RESOLUTION:g} s."))
+
+    if segment["measure"]:
+        meas_start = 0.0 if segment["meas_start"] is None else segment["meas_start"]
+        meas_stop = duration if segment["meas_stop"] is None else segment["meas_stop"]
+        if not 0.0 <= meas_start < meas_stop <= duration + 1e-15:
+            column = COL_MEAS_START if not 0.0 <= meas_start < duration else COL_MEAS_STOP
+            problems.append((column, (
+                f"measure window {meas_start:g} s to {meas_stop:g} s must satisfy "
+                f"0 <= start < stop <= segment time ({duration:g} s)."
+            )))
+
+    return problems
+
+
+def build_segments(sequence_number: int, segments: list[dict], measure_type: int) -> dict:
+    """Convert the validated segments of one sequence tab into the SegArb arrays.
+
+    Segments with "measure" = 1 get measure_type and their measure window (empty start/stop = whole segment);
+    all others get MEAS_NONE with a 0/0 window.
 
     Returns:
-        dict with the lists "times", "start_v", "stop_v", "meas_types", "meas_starts", "meas_stops".
+        dict with the lists "times", "start_v", "stop_v", "meas_types", "meas_starts", "meas_stops", "ssr", "trig".
     """
     label = f"Sequence {sequence_number}"
-    if len(rows) < 2:
-        raise ValueError(f"{label}: at least two points (one segment) are required.")
-    if abs(rows[0][0]) > 1e-15:
-        raise ValueError(f"{label}: the first point must be at 0 s (got {rows[0][0]:g} s).")
-    if len(rows) - 1 > MAX_SEGMENTS_PER_SEQUENCE:
+    if not segments:
+        raise ValueError(f"{label}: at least one segment is required.")
+    if len(segments) > MAX_SEGMENTS_PER_SEQUENCE:
         raise ValueError(
-            f"{label}: {len(rows) - 1} segments exceed the maximum of {MAX_SEGMENTS_PER_SEQUENCE} per sequence."
+            f"{label}: {len(segments)} segments exceed the maximum of {MAX_SEGMENTS_PER_SEQUENCE} per sequence."
         )
 
-    segments = {key: [] for key in ("times", "start_v", "stop_v", "meas_types", "meas_starts", "meas_stops")}
-    for i, (first, second) in enumerate(zip(rows[:-1], rows[1:])):
-        where = f"{label}, segment {i + 1} (points {i + 1}->{i + 2})"
-        t_start, v_start, meas_type, meas_start, meas_stop = first
-        t_stop, v_stop = second[0], second[1]
-
-        duration = t_stop - t_start
-        steps = round(duration / SEGMENT_TIME_RESOLUTION)
-        if steps * SEGMENT_TIME_RESOLUTION < SEGMENT_TIME_MIN - 1e-15:
-            raise ValueError(
-                f"{where}: segment time {duration:g} s is shorter than the minimum of {SEGMENT_TIME_MIN:g} s. "
-                f"Times must increase; model jumps with a finite rise/fall time."
-            )
-        if abs(duration / SEGMENT_TIME_RESOLUTION - steps) > 1e-3:
-            raise ValueError(f"{where}: segment time {duration:g} s is not a multiple of {SEGMENT_TIME_RESOLUTION:g} s.")
-        duration = round(steps * SEGMENT_TIME_RESOLUTION, 10)
-
-        if meas_type == KXCIPMU.MEAS_NONE:
-            meas_start, meas_stop = 0.0, 0.0
+    arrays = {key: [] for key in ("times", "start_v", "stop_v", "meas_types", "meas_starts", "meas_stops", "ssr",
+                                  "trig")}
+    for segment in segments:
+        duration = round(round(segment["time"] / SEGMENT_TIME_RESOLUTION) * SEGMENT_TIME_RESOLUTION, 10)
+        if segment["measure"]:
+            meas_type = measure_type
+            meas_start = 0.0 if segment["meas_start"] is None else segment["meas_start"]
+            meas_stop = duration if segment["meas_stop"] is None else segment["meas_stop"]
         else:
-            meas_start = 0.0 if meas_start is None else meas_start
-            meas_stop = duration if meas_stop is None else meas_stop
-            if not 0.0 <= meas_start < meas_stop <= duration + 1e-15:
-                raise ValueError(
-                    f"{where}: measure window {meas_start:g} s to {meas_stop:g} s must satisfy "
-                    f"0 <= start < stop <= segment time ({duration:g} s)."
-                )
+            meas_type, meas_start, meas_stop = KXCIPMU.MEAS_NONE, 0.0, 0.0
 
-        segments["times"].append(duration)
-        segments["start_v"].append(v_start)
-        segments["stop_v"].append(v_stop)
-        segments["meas_types"].append(meas_type)
-        segments["meas_starts"].append(meas_start)
-        segments["meas_stops"].append(meas_stop)
+        arrays["times"].append(duration)
+        arrays["start_v"].append(segment["start_v"])
+        arrays["stop_v"].append(segment["stop_v"])
+        arrays["meas_types"].append(meas_type)
+        arrays["meas_starts"].append(meas_start)
+        arrays["meas_stops"].append(meas_stop)
+        arrays["ssr"].append(segment["ssr"])
+        arrays["trig"].append(segment["trigger"])
 
-    return segments
+    return arrays
 
 
 def check_sequence_list(sequences: dict, sequence_list: list[tuple[int, int]]) -> None:
@@ -155,170 +176,307 @@ def check_sequence_list(sequences: dict, sequence_list: list[tuple[int, int]]) -
 
 
 # ---------------------------------------------------------------------------
-# GUI: sequence table with measure columns
+# GUI: segment table (one per sequence tab)
 # ---------------------------------------------------------------------------
 
-class KeithleyTableWidget(TableWidget):
-    """Sequence table with the per-segment measure settings as additional columns.
+class SegmentTableWidget(QtWidgets.QWidget):
+    """Editable SegArb segment table, one row per segment (like the SegArb dialog of Clarius).
 
-    Columns: Time in s | Voltage in V | Measure type | Measure start in s | Measure stop in s. Only time and voltage
-    define the plotted points; the measure columns of a row apply to the segment starting at that point.
+    Provides the table API the shared Pulse Builder relies on: the data_changed signal and get_pulse_data() for
+    the plots, csv_path / load_csv() for the setting file and clear_data(). Invalid cells are highlighted in red
+    with the reason as tooltip, without overwriting the user's text.
     """
+
+    data_changed = QtCore.Signal(list, list)
+
+    _COLOR_INVALID = QtGui.QColor(255, 180, 180)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.table.setColumnCount(len(TABLE_HEADERS))
-        self.table.setHorizontalHeaderLabels(TABLE_HEADERS)
-        for column, tooltip in enumerate(TABLE_TOOLTIPS):
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        self.table = QtWidgets.QTableWidget(0, len(SEGMENT_HEADERS), self)
+        self.table.setHorizontalHeaderLabels(SEGMENT_HEADERS)
+        for column, tooltip in enumerate(SEGMENT_TOOLTIPS):
             self.table.horizontalHeaderItem(column).setToolTip(tooltip)
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setStretchLastSection(True)
-        self._fill_measure_cells()
+        self.table.verticalHeader().setToolTip("Segment number")  # row numbers = segment numbers
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.AllEditTriggers)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        layout.addWidget(self.table)
+
+        btn_bar = QtWidgets.QHBoxLayout()
+        self.btn_insert = QtWidgets.QPushButton("Insert Above")
+        self.btn_delete = QtWidgets.QPushButton("Delete Row")
+        self.btn_clear = QtWidgets.QPushButton("Clear All")
+        self.btn_load_csv = QtWidgets.QPushButton("Load from CSV")
+        self.btn_save_csv = QtWidgets.QPushButton("Save to CSV")
+        for button in (self.btn_insert, self.btn_delete, self.btn_clear, self.btn_load_csv, self.btn_save_csv):
+            btn_bar.addWidget(button)
+        layout.addLayout(btn_bar)
+
+        self._block_cell_signals = False
+        self.table.cellChanged.connect(self._on_cell_changed)
+        self.btn_insert.clicked.connect(self._on_insert_above)
+        self.btn_delete.clicked.connect(self._on_delete_rows)
+        self.btn_clear.clicked.connect(self.clear_data)
+        self.btn_load_csv.clicked.connect(self._on_load_csv)
+        self.btn_save_csv.clicked.connect(self._on_save_csv)
+
+        self._add_empty_rows(10)
+
+        self.csv_path: str = ""
 
     # ------------------------------------------------------------------
-    # Keep the measure cells present in every row
+    # Row management
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _make_type_combo(selected: str = DEFAULT_MEASURE_TYPE) -> QtWidgets.QComboBox:
-        combo = QtWidgets.QComboBox()
-        combo.addItems(list(MEASURE_TYPES))
-        combo.setCurrentText(selected if selected in MEASURE_TYPES else DEFAULT_MEASURE_TYPE)
-        return combo
-
-    def _fill_measure_cells(self):
-        """Add the measure type combo and the start/stop items to all rows that miss them."""
-        if self.table.columnCount() < len(TABLE_HEADERS):
-            return  # called by the base __init__ before the columns are added
-        blocked = self._block_cell_signals
-        self._block_cell_signals = True
-        for r in range(self.table.rowCount()):
-            if self.table.cellWidget(r, COL_MEAS_TYPE) is None:
-                self.table.setCellWidget(r, COL_MEAS_TYPE, self._make_type_combo())
-            for column in (COL_MEAS_START, COL_MEAS_STOP):
-                if self.table.item(r, column) is None:
-                    self.table.setItem(r, column, QtWidgets.QTableWidgetItem(""))
-        self._block_cell_signals = blocked
+    def _insert_empty_row(self, row: int) -> None:
+        self.table.insertRow(row)
+        for column in range(self.table.columnCount()):
+            self.table.setItem(row, column, QtWidgets.QTableWidgetItem(""))
 
     def _add_empty_rows(self, n=10):
-        super()._add_empty_rows(n)
-        self._fill_measure_cells()
+        self._block_cell_signals = True
+        for _ in range(n):
+            self._insert_empty_row(self.table.rowCount())
+        self._block_cell_signals = False
+
+    def _row_is_empty(self, r) -> bool:
+        return all(self._text(r, column) == "" for column in range(self.table.columnCount()))
 
     def _ensure_trailing_empty_row(self):
-        super()._ensure_trailing_empty_row()
-        self._fill_measure_cells()
+        rows = self.table.rowCount()
+        if rows == 0 or not self._row_is_empty(rows - 1):
+            self._block_cell_signals = True
+            self._insert_empty_row(rows)
+            self._block_cell_signals = False
 
     def _on_insert_above(self):
-        super()._on_insert_above()
-        self._fill_measure_cells()
+        """Insert a blank segment above the currently selected row."""
+        row = self.table.currentRow() if self.table.selectedIndexes() else max(0, self.table.rowCount() - 1)
+        self._block_cell_signals = True
+        self._insert_empty_row(row)
+        self._block_cell_signals = False
+        self._refresh()
 
-    def add_row(self, timestamp, voltage):
-        super().add_row(timestamp, voltage)
-        self._fill_measure_cells()
+    def _on_delete_rows(self):
+        """Delete all currently selected segments."""
+        rows = sorted({index.row() for index in self.table.selectedIndexes()}, reverse=True)
+        if not rows:
+            return
+        self._block_cell_signals = True
+        for r in rows:
+            self.table.removeRow(r)
+        self._block_cell_signals = False
+        self._ensure_trailing_empty_row()
+        self._refresh()
+
+    def clear_data(self):
+        self.table.setRowCount(0)
+        self._add_empty_rows(10)
+        self._refresh()
+
+    # ------------------------------------------------------------------
+    # Cell editing and validation
+    # ------------------------------------------------------------------
+
+    def _text(self, r, column) -> str:
+        item = self.table.item(r, column)
+        return item.text().strip() if item is not None else ""
+
+    def _on_cell_changed(self, row, column):
+        if self._block_cell_signals:
+            return
+
+        self._block_cell_signals = True
+        text = self._text(row, column)
+        if text and column not in FLAG_COLUMNS:
+            try:
+                self.table.item(row, column).setText("%1.6g" % float(text))
+            except ValueError:
+                pass  # flagged by _refresh
+        if not self._row_is_empty(row):
+            # Show the defaults of the 0/1 columns explicitly once a segment is started
+            for flag_column, default in FLAG_COLUMNS.items():
+                if self._text(row, flag_column) == "":
+                    self.table.item(row, flag_column).setText(str(default))
+            # Continue the waveform seamlessly: pre-fill the next start voltage with this stop voltage
+            if column == COL_STOP_V and row + 1 < self.table.rowCount() and self._text(row + 1, COL_START_V) == "":
+                self.table.item(row + 1, COL_START_V).setText(self._text(row, COL_STOP_V))
+        self._block_cell_signals = False
+
+        self._ensure_trailing_empty_row()
+        self._refresh()
+
+    def _parse_row(self, r):
+        """Parse one row into a segment dict.
+
+        Returns (segment, problems): segment is None if the row holds no segment or a value cannot be parsed;
+        problems is a list of (column, message) covering parse errors and the SegArb rules (except the seamless
+        check, which needs the previous segment).
+        """
+        if all(self._text(r, column) == "" for column in range(self.table.columnCount()) if column != COL_START_V):
+            return None, []  # empty, or only the pre-filled start voltage of a segment not started yet
+
+        problems = []
+        values = {}
+        for key, column in (("start_v", COL_START_V), ("stop_v", COL_STOP_V), ("time", COL_TIME)):
+            try:
+                values[key] = float(self._text(r, column))
+            except ValueError:
+                problems.append((column, f"'{SEGMENT_HEADERS[column]}' must be a number."))
+        for key, column in (("meas_start", COL_MEAS_START), ("meas_stop", COL_MEAS_STOP)):
+            text = self._text(r, column)
+            try:
+                values[key] = float(text) if text else None
+            except ValueError:
+                problems.append((column, f"'{SEGMENT_HEADERS[column]}' must be a number or empty."))
+        for key, column in (("measure", COL_MEASURE), ("ssr", COL_SSR), ("trigger", COL_TRIGGER)):
+            text = self._text(r, column)
+            if text == "":
+                values[key] = FLAG_COLUMNS[column]
+            elif text in ("0", "1"):
+                values[key] = int(text)
+            else:
+                problems.append((column, f"'{SEGMENT_HEADERS[column]}' must be 0 or 1."))
+
+        if problems:
+            return None, problems
+        return values, segment_problems(values, None)
+
+    def _refresh(self):
+        """Highlight invalid cells and emit the plot data."""
+        self._block_cell_signals = True
+        previous_stop_v = None
+        for r in range(self.table.rowCount()):
+            segment, problems = self._parse_row(r)
+            if segment is not None:
+                problems += [p for p in segment_problems(segment, previous_stop_v) if p[0] == COL_START_V]
+                previous_stop_v = segment["stop_v"]
+            bad = {}
+            for column, message in problems:
+                bad.setdefault(column, message)
+            for column in range(self.table.columnCount()):
+                item = self.table.item(r, column)
+                if item is None:
+                    continue
+                item.setBackground(self._COLOR_INVALID if column in bad else QtGui.QBrush())
+                item.setToolTip(bad.get(column, ""))
+        self._block_cell_signals = False
+        self._emit_data_changed()
+
+    def _emit_data_changed(self):
+        xs, ys = self.get_pulse_data()
+        self.data_changed.emit(xs, ys)
 
     # ------------------------------------------------------------------
     # Data access
     # ------------------------------------------------------------------
 
-    def get_rows(self) -> list[tuple]:
-        """Return [(time, voltage, measure_type, measure_start, measure_stop), ...] for all valid points.
+    def get_pulse_data(self):
+        """Return (timestamps, voltages) of the segment corners for the plots.
 
-        measure_type is the KXCI enum; measure_start/stop are None when left empty. Rows without a valid time and
-        voltage are skipped (like in get_pulse_data), an invalid measure start/stop raises a ValueError.
+        Rows that cannot be parsed are skipped; the segments are placed back to back starting at 0 s.
         """
-        rows = []
+        xs, ys = [], []
+        t = 0.0
         for r in range(self.table.rowCount()):
-            try:
-                t = float(self.table.item(r, COL_TIME).text().strip())
-                v = float(self.table.item(r, COL_VOLTAGE).text().strip())
-            except Exception:
+            segment, _problems = self._parse_row(r)
+            if segment is None:
                 continue
-            combo = self.table.cellWidget(r, COL_MEAS_TYPE)
-            meas_type = MEASURE_TYPES[combo.currentText()] if combo else MEASURE_TYPES[DEFAULT_MEASURE_TYPE]
-            window = []
-            for column in (COL_MEAS_START, COL_MEAS_STOP):
-                item = self.table.item(r, column)
-                text = item.text().strip() if item else ""
-                try:
-                    window.append(float(text) if text else None)
-                except ValueError:
-                    raise ValueError(f"Row {r + 1}: '{TABLE_HEADERS[column]}' must be a number, got '{text}'.")
-            rows.append((t, v, meas_type, *window))
-        return rows
+            xs += [t, t + segment["time"]]
+            ys += [segment["start_v"], segment["stop_v"]]
+            t += segment["time"]
+        return xs, ys
+
+    def get_segments(self) -> list[dict]:
+        """Return all segments for a run; raises ValueError naming the first invalid segment."""
+        segments = []
+        previous_stop_v = None
+        for r in range(self.table.rowCount()):
+            segment, problems = self._parse_row(r)
+            if segment is not None:
+                problems += [p for p in segment_problems(segment, previous_stop_v) if p[0] == COL_START_V]
+            if problems:
+                raise ValueError(f"Segment {r + 1}: {problems[0][1]}")
+            if segment is None:
+                continue  # empty row
+            segments.append(segment)
+            previous_stop_v = segment["stop_v"]
+        return segments
 
     # ------------------------------------------------------------------
-    # CSV with all five columns
+    # CSV
     # ------------------------------------------------------------------
 
     def _on_save_csv(self):
-        """Save all valid points including their measure settings to a CSV file."""
+        """Save all non-empty segment rows to a CSV file."""
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self.table, "Save Sequence to CSV", CSV_DEFAULT_DIR, "CSV files (*.csv);;All files (*.*)"
         )
         if not path:
             return
         try:
-            type_names = {value: name for name, value in MEASURE_TYPES.items()}
             with open(path, "w", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow(TABLE_HEADERS)
-                for t, v, meas_type, meas_start, meas_stop in self.get_rows():
-                    writer.writerow([
-                        "%1.6g" % t,
-                        "%1.6g" % v,
-                        type_names[meas_type],
-                        "" if meas_start is None else "%1.6g" % meas_start,
-                        "" if meas_stop is None else "%1.6g" % meas_stop,
-                    ])
+                writer.writerow(SEGMENT_HEADERS)
+                for r in range(self.table.rowCount()):
+                    if not self._row_is_empty(r):
+                        writer.writerow([self._text(r, column) for column in range(self.table.columnCount())])
             self.csv_path = path
         except Exception:
             error()
 
-    def load_csv(self, path) -> None:
-        """Load a sequence CSV, replacing the table contents.
+    def _on_load_csv(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self.table, "Load Sequence from CSV", CSV_DEFAULT_DIR, "CSV files (*.csv);;All files (*.*)"
+        )
+        if not path:
+            return
+        self.load_csv(path)
 
-        Accepts the five-column format written by _on_save_csv and plain two-column (time, voltage) files of the
-        base Pulse Builder; missing measure settings get the defaults. Header and non-numeric lines are skipped.
+    def load_csv(self, path) -> None:
+        """Load segments from a CSV file (columns as in the table), replacing the table contents.
+
+        The header and any line whose first cell is not a number are skipped; missing trailing columns stay empty.
         """
         try:
             rows = []
             with open(path, newline="") as f:
                 for row in csv.reader(f):
-                    if len(row) < 2:
-                        continue
                     try:
-                        t, v = float(row[0].strip()), float(row[1].strip())
-                    except ValueError:
-                        continue  # skip header or non-numeric lines
-                    extra = [cell.strip() for cell in row[2:5]] + [""] * (3 - len(row[2:5]))
-                    rows.append((t, v, *extra))
+                        float(row[0].strip())
+                    except (IndexError, ValueError):
+                        continue
+                    rows.append([cell.strip() for cell in row[:len(SEGMENT_HEADERS)]])
             if not rows:
                 return
 
             self.table.setRowCount(0)
             self._block_cell_signals = True
-            for t, v, meas_type, meas_start, meas_stop in rows:
+            for cells in rows:
                 r = self.table.rowCount()
-                self.table.insertRow(r)
-                self.table.setItem(r, COL_TIME, QtWidgets.QTableWidgetItem("%1.6g" % t))
-                self.table.setItem(r, COL_VOLTAGE, QtWidgets.QTableWidgetItem("%1.6g" % v))
-                self.table.setCellWidget(r, COL_MEAS_TYPE, self._make_type_combo(meas_type or DEFAULT_MEASURE_TYPE))
-                self.table.setItem(r, COL_MEAS_START, QtWidgets.QTableWidgetItem(meas_start))
-                self.table.setItem(r, COL_MEAS_STOP, QtWidgets.QTableWidgetItem(meas_stop))
+                self._insert_empty_row(r)
+                for column, text in enumerate(cells):
+                    self.table.item(r, column).setText(text)
             self._block_cell_signals = False
             self._ensure_trailing_empty_row()
-            self._emit_data_changed()
+            self._refresh()
             self.csv_path = path
         except Exception:
             error()
 
 
 class KeithleySequenceTabWidget(SequenceTabWidget):
-    """SequenceTabWidget that instantiates KeithleyTableWidget instead of TableWidget."""
+    """SequenceTabWidget that instantiates SegmentTableWidget instead of the point-based TableWidget."""
 
     def add_sequence_tab(self):
         seq_idx = self.sequence_count()
-        table = KeithleyTableWidget()
+        table = SegmentTableWidget()
         table.data_changed.connect(self._on_any_data_changed)
 
         insert_pos = self.count() - 1 if self._plus_tab_added else self.count()
@@ -333,24 +491,24 @@ class KeithleySequenceTabWidget(SequenceTabWidget):
 
 
 class KeithleyPulseBuilderWidget(Widget):
-    """Pulse Builder using the sequence tables with measure columns."""
+    """Pulse Builder using the SegArb segment tables."""
 
     def _create_layout(self):
         self.plot_widget = PlotWidget()
         self.sequence_tabs = KeithleySequenceTabWidget(self)
         self.waveform_table = WaveformTableWidget(self)
 
-        # Top row: sequence plot (left) + sequence tabs (right); the tables are wider due to the measure columns
+        # Top row: sequence plot (left) + segment tables (right); the tables are wide due to the eight columns
         top_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         top_splitter.addWidget(self.plot_widget.seq_canvas)
         top_splitter.addWidget(self.sequence_tabs)
-        top_splitter.setSizes([400, 500])
+        top_splitter.setSizes([400, 600])
 
         # Bottom row: waveform plot (left) + waveform table (right)
         bot_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         bot_splitter.addWidget(self.plot_widget.wf_canvas)
         bot_splitter.addWidget(self.waveform_table)
-        bot_splitter.setSizes([400, 500])
+        bot_splitter.setSizes([400, 600])
 
         v_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
         v_splitter.addWidget(top_splitter)
@@ -370,9 +528,9 @@ class Main():
     """
     <h2>Pulse Builder &ndash; Keithley 4200A-SCS (SegArb via KXCI)</h2>
 
-    <p>Draw pulse sequences in the Pulse Builder and play them on one PMU channel of a Keithley 4200A-SCS as a
-    <b>segmented arbitrary (SegArb) waveform</b>. The <b>voltage</b>, <b>current</b> and <b>time</b> samples of the
-    measured segments are returned as three equally long traces.</p>
+    <p>Define segmented arbitrary (SegArb) waveforms segment by segment, like in the SegArb dialog of Clarius, and
+    play them on one PMU channel of a Keithley 4200A-SCS. The <b>voltage</b>, <b>current</b> and <b>time</b>
+    samples of the measured segments are returned as three equally long traces.</p>
 
     <p>Communication uses <b>KXCI</b> (Keithley External Control Interface) over a raw TCP/IP socket. KXCI must be
     enabled on the 4200A-SCS and the instrument reachable at the configured address before the run is started.</p>
@@ -381,8 +539,13 @@ class Main():
     <ul>
     <li><b>Port</b> &ndash; VISA SOCKET address of the KXCI server, e.g.
     <code>TCPIP0::192.168.100.4::8888::SOCKET</code>.</li>
-    <li><b>Channel</b> &ndash; PMU channel to pulse and measure (card 1: 1, 2; card 2: 3, 4; ...). Entered as
-    text, so any channel number the mainframe offers can be used.</li>
+    <li><b>PMU card</b> &ndash; number of the pulse card as named in Clarius/KCon (<code>1</code> for PMU1,
+    <code>2</code> for PMU2, ...). This is not the physical slot: a PMU in slot 5 is still PMU1 if it is the
+    first pulse card.</li>
+    <li><b>Channel</b> &ndash; channel on that card, 1 or 2. KXCI numbers the channels across all cards (PMU1: 1,
+    2; PMU2: 3, 4; ...); the script converts card and channel accordingly.</li>
+    <li><b>Measure type</b> &ndash; applied to every segment with <i>Measure</i> = 1: waveform (all samples) or spot
+    mean (one value per segment), each discrete or averaged over the repetitions.</li>
     <li><b>Voltage source range in V</b> &ndash; <code>10</code> or <code>40</code>; must cover the largest absolute
     voltage.</li>
     <li><b>Current measure range in A</b> &ndash; fixed current range (SegArb requires a fixed range), e.g.
@@ -395,13 +558,18 @@ class Main():
 
     <h3>Defining the waveform</h3>
     <ul>
-    <li>Each <b>sequence tab</b> becomes one SegArb sequence. Its points are absolute times within the sequence and
-    must start at 0&nbsp;s. Each pair of consecutive points is one segment (min. 20&nbsp;ns, 10&nbsp;ns
-    resolution, max. 128 segments per sequence). Jumps need a finite rise/fall time.</li>
-    <li><b>Measure type</b>, <b>Measure start</b> and <b>Measure stop</b> of a row apply to the segment starting at
-    that point (they are ignored on the last point). Start and stop are relative to the segment start; empty means
-    0&nbsp;s and the segment end, i.e. the whole segment. Waveform and spot-mean types cannot be mixed in one
-    waveform.</li>
+    <li>Each <b>sequence tab</b> becomes one SegArb sequence; each row is one segment (row number = segment number,
+    max. 128 segments per sequence).</li>
+    <li><b>Start/Stop voltage in V</b> &ndash; the voltage ramps linearly from start to stop over the segment. The
+    start voltage must equal the stop voltage of the previous segment (it is pre-filled when you enter a stop
+    voltage).</li>
+    <li><b>Segment time in s</b> &ndash; min. 20&nbsp;ns, in steps of 10&nbsp;ns.</li>
+    <li><b>Measure (0/1)</b> &ndash; measure this segment with the selected measure type. <b>Measure start/stop in
+    s</b> optionally limit the measurement to a window relative to the segment start; empty means the whole
+    segment.</li>
+    <li><b>SSR (0/1)</b> &ndash; 1 closes the output relay, 0 leaves the output floating (relay transitions need
+    at least 25&nbsp;&micro;s). <b>Trigger out (0/1)</b> &ndash; level of the trigger output during the segment.</li>
+    <li>Invalid cells are highlighted in red; hover over them for the reason.</li>
     <li>The <b>waveform table</b> sets the playback order and repetitions. Consecutive sequences &ndash; and repeated
     ones &ndash; must connect seamlessly: each sequence has to end at the start voltage of the next.</li>
     </ul>
@@ -423,7 +591,9 @@ class Main():
 
     arguments = {
         "Port": "TCPIP0::192.168.100.4::8888::SOCKET",
-        "Channel": "1",
+        "PMU card": "1",
+        "Channel": ["1", "2"],
+        "Measure type": list(MEASURE_TYPES),
         "Voltage source range in V": ["10", "40"],
         "Current measure range in A": 1e-6,
         "Load in Ohm": 1e6,
@@ -505,25 +675,26 @@ class Main():
     # ------------------------------------------------------------------ #
 
     def main(self, **kwargs):
-        self.channel = channel = self._parse_channel(kwargs["Channel"])
+        card = self._parse_card(kwargs["PMU card"])
+        card_channel = int(kwargs["Channel"])
+        # KXCI numbers the pulse channels across all cards: PMU1 -> 1, 2; PMU2 -> 3, 4; ...
+        self.channel = channel = (card - 1) * 2 + card_channel
+        measure_type = MEASURE_TYPES[kwargs["Measure type"]]
         voltage_range = int(kwargs["Voltage source range in V"])
         current_range = float(kwargs["Current measure range in A"])
         load = float(kwargs["Load in Ohm"])
         sample_rate = float(kwargs["Sample rate in Sa/s"])
         configure_rpm = bool(kwargs["Configure RPM"])
 
-        sequences, sequence_list = self._read_waveform()
+        sequences, sequence_list = self._read_waveform(measure_type)
 
-        for seq_id, segments in sequences.items():
-            v_max = max(abs(v) for v in segments["start_v"] + segments["stop_v"])
+        for seq_id, arrays in sequences.items():
+            v_max = max(abs(v) for v in arrays["start_v"] + arrays["stop_v"])
             if v_max > voltage_range:
                 raise ValueError(
                     f"Sequence {seq_id} reaches {v_max:g} V, which exceeds the {voltage_range} V source range."
                 )
-
-        measure_types = {t for segments in sequences.values() for t in segments["meas_types"]} - {KXCIPMU.MEAS_NONE}
-        if measure_types & WAVEFORM_TYPES and measure_types & SPOT_MEAN_TYPES:
-            raise ValueError("Waveform and spot-mean measure types cannot be mixed in one waveform.")
+        is_measured = any(t != KXCIPMU.MEAS_NONE for arrays in sequences.values() for t in arrays["meas_types"])
 
         self._ensure_connected(kwargs["Port"])
         pmu = self.pmu
@@ -536,7 +707,7 @@ class Main():
         # :PMU:INIT must come first - it also clears the data buffer and deletes any previously defined sequences.
         pmu.init(KXCIPMU.MODE_SEGARB)
         if configure_rpm:
-            pmu.configure_rpm(self._rpm_hrid(channel), KXCIPMU.RPM_MODE_PMU)
+            pmu.configure_rpm(f"PMU{card}-{card_channel}", KXCIPMU.RPM_MODE_PMU)
         # SegArb requires fixed ranges for both voltage (source) and current (measure).
         pmu.set_source_range(channel, voltage_range)
         pmu.set_measure_range(channel, KXCIPMU.RANGE_FIXED, current_range)
@@ -546,13 +717,15 @@ class Main():
         if setup_error:
             raise RuntimeError(f"PMU channel setup (RPM/ranges/load) failed - instrument reports: {setup_error}")
 
-        for seq_id, segments in sequences.items():
-            pmu.set_segment_times(channel, seq_id, segments["times"])
-            pmu.set_start_voltages(channel, seq_id, segments["start_v"])
-            pmu.set_stop_voltages(channel, seq_id, segments["stop_v"])
-            pmu.set_measure_types(channel, seq_id, segments["meas_types"])
-            pmu.set_measure_starts(channel, seq_id, segments["meas_starts"])
-            pmu.set_measure_stops(channel, seq_id, segments["meas_stops"])
+        for seq_id, arrays in sequences.items():
+            pmu.set_segment_times(channel, seq_id, arrays["times"])
+            pmu.set_start_voltages(channel, seq_id, arrays["start_v"])
+            pmu.set_stop_voltages(channel, seq_id, arrays["stop_v"])
+            pmu.set_measure_types(channel, seq_id, arrays["meas_types"])
+            pmu.set_measure_starts(channel, seq_id, arrays["meas_starts"])
+            pmu.set_measure_stops(channel, seq_id, arrays["meas_stops"])
+            pmu.set_ssr(channel, seq_id, arrays["ssr"])
+            pmu.set_triggers(channel, seq_id, arrays["trig"])
 
         pmu.set_sequence_list(channel, sequence_list)
         pmu.set_sample_rate(sample_rate)
@@ -563,9 +736,9 @@ class Main():
             pmu.set_output_state(channel, KXCIPMU.OUTPUT_ON)
             pmu.execute()
             self._wait_until_idle(timeout=2 * total_duration + START_TIMEOUT_S)
-            if not measure_types:
+            if not is_measured:
                 voltage, current, timestamp = [], [], []
-            elif measure_types & SPOT_MEAN_TYPES:
+            elif measure_type in SPOT_MEAN_TYPES:
                 voltage = pmu.read_value(channel, "VH")
                 current = pmu.read_value(channel, "IH")
                 timestamp = pmu.read_value(channel, "TH")
@@ -581,11 +754,11 @@ class Main():
     # helpers
     # ------------------------------------------------------------------ #
 
-    def _read_waveform(self):
+    def _read_waveform(self, measure_type: int):
         """Convert the Pulse Builder content into SegArb sequences and the sequence list.
 
         Returns:
-            sequences: {seq_id: segment arrays of build_segments()} for every sequence used in the waveform.
+            sequences: {seq_id: SegArb arrays of build_segments()} for every sequence used in the waveform.
             sequence_list: [(seq_id, repetitions), ...] in playback order.
         """
         sequence_list = self.widget.waveform_table.get_waveform_data()
@@ -596,34 +769,24 @@ class Main():
         for seq_id, _reps in sequence_list:
             if seq_id not in sequences:
                 try:
-                    rows = self.widget.sequence_tabs.widget(seq_id - 1).get_rows()
+                    segments = self.widget.sequence_tabs.widget(seq_id - 1).get_segments()
                 except ValueError as e:
-                    raise ValueError(f"Sequence {seq_id}: {e}") from None
-                sequences[seq_id] = build_segments(seq_id, rows)
+                    raise ValueError(f"Sequence {seq_id}, {e}") from None
+                sequences[seq_id] = build_segments(seq_id, segments, measure_type)
 
         check_sequence_list(sequences, sequence_list)
         return sequences, sequence_list
 
     @staticmethod
-    def _parse_channel(text) -> int:
-        """Parse the Channel argument (entered as text) into a positive channel number."""
+    def _parse_card(text) -> int:
+        """Parse the PMU card argument (entered as text, 1 for PMU1, ...) into a positive card number."""
         try:
-            channel = int(str(text).strip())
+            card = int(str(text).strip())
         except ValueError:
-            raise ValueError(f"Channel must be a positive integer, got '{text}'.") from None
-        if channel < 1:
-            raise ValueError(f"Channel must be a positive integer, got '{text}'.")
-        return channel
-
-    @staticmethod
-    def _rpm_hrid(channel: int) -> str:
-        """Map a global pulse channel to its RPM id ``PMU<card>-<channel-on-card>``.
-
-        Each PMU card carries two channels, so channels 1,2 -> PMU1-1,PMU1-2; 3,4 -> PMU2-1, ...
-        """
-        card = (channel - 1) // 2 + 1
-        channel_on_card = (channel - 1) % 2 + 1
-        return f"PMU{card}-{channel_on_card}"
+            raise ValueError(f"PMU card must be a positive integer (1 for PMU1, ...), got '{text}'.") from None
+        if card < 1:
+            raise ValueError(f"PMU card must be a positive integer (1 for PMU1, ...), got '{text}'.")
+        return card
 
     def _read_error(self) -> str:
         """Return the instrument's last KXCI error message, or '' if there is none.
