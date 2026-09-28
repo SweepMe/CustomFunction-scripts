@@ -381,7 +381,8 @@ class Main():
     <ul>
     <li><b>Port</b> &ndash; VISA SOCKET address of the KXCI server, e.g.
     <code>TCPIP0::192.168.100.4::8888::SOCKET</code>.</li>
-    <li><b>Channel</b> &ndash; PMU channel to pulse and measure (card 1: 1, 2; card 2: 3, 4; ...).</li>
+    <li><b>Channel</b> &ndash; PMU channel to pulse and measure (card 1: 1, 2; card 2: 3, 4; ...). Entered as
+    text, so any channel number the mainframe offers can be used.</li>
     <li><b>Voltage source range in V</b> &ndash; <code>10</code> or <code>40</code>; must cover the largest absolute
     voltage.</li>
     <li><b>Current measure range in A</b> &ndash; fixed current range (SegArb requires a fixed range), e.g.
@@ -422,7 +423,7 @@ class Main():
 
     arguments = {
         "Port": "TCPIP0::192.168.100.4::8888::SOCKET",
-        "Channel": [1, 2, 3, 4, 5, 6, 7, 8],
+        "Channel": "1",
         "Voltage source range in V": ["10", "40"],
         "Current measure range in A": 1e-6,
         "Load in Ohm": 1e6,
@@ -504,7 +505,7 @@ class Main():
     # ------------------------------------------------------------------ #
 
     def main(self, **kwargs):
-        self.channel = channel = int(kwargs["Channel"])
+        self.channel = channel = self._parse_channel(kwargs["Channel"])
         voltage_range = int(kwargs["Voltage source range in V"])
         current_range = float(kwargs["Current measure range in A"])
         load = float(kwargs["Load in Ohm"])
@@ -604,8 +605,19 @@ class Main():
         return sequences, sequence_list
 
     @staticmethod
+    def _parse_channel(text) -> int:
+        """Parse the Channel argument (entered as text) into a positive channel number."""
+        try:
+            channel = int(str(text).strip())
+        except ValueError:
+            raise ValueError(f"Channel must be a positive integer, got '{text}'.") from None
+        if channel < 1:
+            raise ValueError(f"Channel must be a positive integer, got '{text}'.")
+        return channel
+
+    @staticmethod
     def _rpm_hrid(channel: int) -> str:
-        """Map a global pulse channel (1-8) to its RPM id ``PMU<card>-<channel-on-card>``.
+        """Map a global pulse channel to its RPM id ``PMU<card>-<channel-on-card>``.
 
         Each PMU card carries two channels, so channels 1,2 -> PMU1-1,PMU1-2; 3,4 -> PMU2-1, ...
         """
