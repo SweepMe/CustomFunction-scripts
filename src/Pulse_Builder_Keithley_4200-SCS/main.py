@@ -262,4 +262,4 @@ if __name__ == "__main__":
     finally:
         script.disconnect()
 
-    print("CustomFunction script 'KXCI-Pulses' finished.")
+    print("CustomFunction script 'Pulse_Builder_Keithley_4200-SCS' finished.")
