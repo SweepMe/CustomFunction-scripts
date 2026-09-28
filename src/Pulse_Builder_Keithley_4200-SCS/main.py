@@ -4,18 +4,20 @@
 """CustomFunction script: Pulse Builder for the Keithley 4200A-SCS PMU (SegArb via KXCI).
 
 The pulse sequences and their playback order are drawn in the shared Pulse Builder GUI (libs/pulse_builder.py).
-Each sequence tab becomes one SegArb sequence on the instrument, each pair of consecutive (time, voltage) points
-one segment. The waveform table becomes the SegArb sequence list. Every segment is measured (waveform-discrete)
-over its full duration; the captured voltage, current and timestamp are returned as three arrays.
+Each sequence tab becomes one SegArb sequence on the instrument, each pair of consecutive points one segment. The
+measure type, start and stop of a segment are set in the row of its first point. The waveform table becomes the
+SegArb sequence list. The captured voltage, current and timestamp are returned as three arrays.
 """
 from __future__ import annotations
 
+import csv
 import time
 
 import numpy as np
-from PySide6 import QtWidgets
+from PySide6 import QtCore, QtWidgets
 
 from pysweepme import FolderManager, Ports
+from pysweepme.ErrorMessage import error
 FolderManager.addFolderToPATH()  # makes libs/kxci_pmu.py and libs/pulse_builder.py importable
 
 import importlib
@@ -24,7 +26,16 @@ import kxci_pmu
 importlib.reload(kxci_pmu)
 
 from kxci_pmu import KXCIPMU
-from pulse_builder import Widget
+from pulse_builder import (
+    Widget,
+    PlotWidget,
+    SequenceTabWidget,
+    TableWidget,
+    WaveformTableWidget,
+    CSV_DEFAULT_DIR,
+    _color_icon,
+    _sequence_color,
+)
 
 
 # SegArb timing limits (KXCI manual, :PMU:SARB:SEQ:TIME)
@@ -34,51 +45,91 @@ MAX_SEGMENTS_PER_SEQUENCE = 128  # one :PMU:SARB:SEQ:* call; the ...:ADD variant
 
 START_TIMEOUT_S = 10.0  # max. time between :PMU:EXECUTE and the test reporting RUNNING
 
-CURRENT_RANGES = ["1e-7", "1e-6", "1e-5", "1e-4", "1e-3", "1e-2", "2e-1", "8e-1"]
-VOLTAGE_RANGES = ["10", "40"]
+# Measure types of :PMU:SARB:SEQ:MEAS:TYPE as shown in the sequence table
+MEASURE_TYPES = {
+    "None": KXCIPMU.MEAS_NONE,
+    "Waveform discrete": KXCIPMU.MEAS_WAVEFORM_DISCRETE,
+    "Waveform average": KXCIPMU.MEAS_WAVEFORM_AVERAGE,
+    "Spot mean discrete": KXCIPMU.MEAS_SPOT_MEAN_DISCRETE,
+    "Spot mean average": KXCIPMU.MEAS_SPOT_MEAN_AVERAGE,
+}
+DEFAULT_MEASURE_TYPE = "Waveform discrete"
+WAVEFORM_TYPES = {KXCIPMU.MEAS_WAVEFORM_DISCRETE, KXCIPMU.MEAS_WAVEFORM_AVERAGE}
+SPOT_MEAN_TYPES = {KXCIPMU.MEAS_SPOT_MEAN_DISCRETE, KXCIPMU.MEAS_SPOT_MEAN_AVERAGE}
+
+# Sequence table columns
+COL_TIME, COL_VOLTAGE, COL_MEAS_TYPE, COL_MEAS_START, COL_MEAS_STOP = range(5)
+TABLE_HEADERS = ["Time in s", "Voltage in V", "Measure type", "Measure start in s", "Measure stop in s"]
+TABLE_TOOLTIPS = [
+    "Absolute time of the point within the sequence; the first point must be at 0 s",
+    "Voltage of the point",
+    "Measure type of the segment starting at this point (ignored on the last point)",
+    "Measure start relative to the segment start; empty = 0 s",
+    "Measure stop relative to the segment start; empty = end of the segment",
+]
 
 
 # ---------------------------------------------------------------------------
-# Waveform conversion: Pulse Builder points -> SegArb segments
+# Waveform conversion: sequence table rows -> SegArb segments
 # ---------------------------------------------------------------------------
 
-def build_segments(sequence_number: int, xs: list[float], ys: list[float]):
-    """Convert the (time, voltage) points of one sequence tab into SegArb segment arrays.
+def build_segments(sequence_number: int, rows: list[tuple]) -> dict:
+    """Convert the rows of one sequence tab into the SegArb segment arrays.
 
-    The points are absolute times within the sequence (first point at 0 s). Consecutive points give one segment each:
-    its duration is the time difference, its start/stop voltages are the two point voltages. This guarantees the
-    seamless transitions SegArb requires within a sequence.
+    rows: [(time, voltage, measure_type, measure_start, measure_stop), ...] with absolute times within the sequence
+    (first point at 0 s). Consecutive points give one segment each: its duration is the time difference, its
+    start/stop voltages are the two point voltages - which guarantees the seamless transitions SegArb requires. The
+    measure settings of a segment are taken from its first point; measure_start/stop may be None (= 0 s / segment end).
 
     Returns:
-        (times, start_voltages, stop_voltages) - three lists of equal length.
+        dict with the lists "times", "start_v", "stop_v", "meas_types", "meas_starts", "meas_stops".
     """
     label = f"Sequence {sequence_number}"
-    if len(xs) < 2:
+    if len(rows) < 2:
         raise ValueError(f"{label}: at least two points (one segment) are required.")
-    if abs(xs[0]) > 1e-15:
-        raise ValueError(f"{label}: the first point must be at 0 s (got {xs[0]:g} s).")
-    if len(xs) - 1 > MAX_SEGMENTS_PER_SEQUENCE:
+    if abs(rows[0][0]) > 1e-15:
+        raise ValueError(f"{label}: the first point must be at 0 s (got {rows[0][0]:g} s).")
+    if len(rows) - 1 > MAX_SEGMENTS_PER_SEQUENCE:
         raise ValueError(
-            f"{label}: {len(xs) - 1} segments exceed the maximum of {MAX_SEGMENTS_PER_SEQUENCE} per sequence."
+            f"{label}: {len(rows) - 1} segments exceed the maximum of {MAX_SEGMENTS_PER_SEQUENCE} per sequence."
         )
 
-    times = []
-    for i, (t_start, t_stop) in enumerate(zip(xs[:-1], xs[1:])):
+    segments = {key: [] for key in ("times", "start_v", "stop_v", "meas_types", "meas_starts", "meas_stops")}
+    for i, (first, second) in enumerate(zip(rows[:-1], rows[1:])):
+        where = f"{label}, segment {i + 1} (points {i + 1}->{i + 2})"
+        t_start, v_start, meas_type, meas_start, meas_stop = first
+        t_stop, v_stop = second[0], second[1]
+
         duration = t_stop - t_start
         steps = round(duration / SEGMENT_TIME_RESOLUTION)
         if steps * SEGMENT_TIME_RESOLUTION < SEGMENT_TIME_MIN - 1e-15:
             raise ValueError(
-                f"{label}, points {i + 1}->{i + 2}: segment time {duration:g} s is shorter than the minimum of "
-                f"{SEGMENT_TIME_MIN:g} s. Times must increase; model jumps with a finite rise/fall time."
+                f"{where}: segment time {duration:g} s is shorter than the minimum of {SEGMENT_TIME_MIN:g} s. "
+                f"Times must increase; model jumps with a finite rise/fall time."
             )
         if abs(duration / SEGMENT_TIME_RESOLUTION - steps) > 1e-3:
-            raise ValueError(
-                f"{label}, points {i + 1}->{i + 2}: segment time {duration:g} s is not a multiple of "
-                f"{SEGMENT_TIME_RESOLUTION:g} s."
-            )
-        times.append(round(steps * SEGMENT_TIME_RESOLUTION, 10))
+            raise ValueError(f"{where}: segment time {duration:g} s is not a multiple of {SEGMENT_TIME_RESOLUTION:g} s.")
+        duration = round(steps * SEGMENT_TIME_RESOLUTION, 10)
 
-    return times, list(ys[:-1]), list(ys[1:])
+        if meas_type == KXCIPMU.MEAS_NONE:
+            meas_start, meas_stop = 0.0, 0.0
+        else:
+            meas_start = 0.0 if meas_start is None else meas_start
+            meas_stop = duration if meas_stop is None else meas_stop
+            if not 0.0 <= meas_start < meas_stop <= duration + 1e-15:
+                raise ValueError(
+                    f"{where}: measure window {meas_start:g} s to {meas_stop:g} s must satisfy "
+                    f"0 <= start < stop <= segment time ({duration:g} s)."
+                )
+
+        segments["times"].append(duration)
+        segments["start_v"].append(v_start)
+        segments["stop_v"].append(v_stop)
+        segments["meas_types"].append(meas_type)
+        segments["meas_starts"].append(meas_start)
+        segments["meas_stops"].append(meas_stop)
+
+    return segments
 
 
 def check_sequence_list(sequences: dict, sequence_list: list[tuple[int, int]]) -> None:
@@ -89,156 +140,225 @@ def check_sequence_list(sequences: dict, sequence_list: list[tuple[int, int]]) -
     """
     previous = None
     for seq_id, reps in sequence_list:
-        _times, start_v, stop_v = sequences[seq_id]
-        if reps > 1 and stop_v[-1] != start_v[0]:
+        start_v, stop_v = sequences[seq_id]["start_v"][0], sequences[seq_id]["stop_v"][-1]
+        if reps > 1 and stop_v != start_v:
             raise ValueError(
-                f"Sequence {seq_id} is repeated {reps} times, but ends at {stop_v[-1]:g} V and starts at "
-                f"{start_v[0]:g} V. Repeated sequences must end at their start voltage."
+                f"Sequence {seq_id} is repeated {reps} times, but ends at {stop_v:g} V and starts at {start_v:g} V. "
+                f"Repeated sequences must end at their start voltage."
             )
-        if previous is not None and sequences[previous][2][-1] != start_v[0]:
+        if previous is not None and sequences[previous]["stop_v"][-1] != start_v:
             raise ValueError(
-                f"Sequence {previous} ends at {sequences[previous][2][-1]:g} V, but the following sequence {seq_id} "
-                f"starts at {start_v[0]:g} V. Consecutive sequences must connect seamlessly."
+                f"Sequence {previous} ends at {sequences[previous]['stop_v'][-1]:g} V, but the following sequence "
+                f"{seq_id} starts at {start_v:g} V. Consecutive sequences must connect seamlessly."
             )
         previous = seq_id
 
 
 # ---------------------------------------------------------------------------
-# GUI: instrument settings + Pulse Builder
+# GUI: sequence table with measure columns
 # ---------------------------------------------------------------------------
 
-class InstrumentSettingsWidget(QtWidgets.QGroupBox):
-    """Connection, channel and range settings of the 4200A-SCS PMU."""
+class KeithleyTableWidget(TableWidget):
+    """Sequence table with the per-segment measure settings as additional columns.
+
+    Columns: Time in s | Voltage in V | Measure type | Measure start in s | Measure stop in s. Only time and voltage
+    define the plotted points; the measure columns of a row apply to the segment starting at that point.
+    """
 
     def __init__(self, parent=None):
-        super().__init__("Keithley 4200A-SCS PMU (KXCI)", parent)
+        super().__init__(parent)
+        self.table.setColumnCount(len(TABLE_HEADERS))
+        self.table.setHorizontalHeaderLabels(TABLE_HEADERS)
+        for column, tooltip in enumerate(TABLE_TOOLTIPS):
+            self.table.horizontalHeaderItem(column).setToolTip(tooltip)
+        self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self._fill_measure_cells()
 
-        self.port_edit = QtWidgets.QLineEdit("TCPIP0::192.168.100.4::8888::SOCKET")
-        self.port_edit.setToolTip("VISA SOCKET address of the KXCI server")
+    # ------------------------------------------------------------------
+    # Keep the measure cells present in every row
+    # ------------------------------------------------------------------
 
-        self.channel_spin = QtWidgets.QSpinBox()
-        self.channel_spin.setRange(1, 8)
-        self.channel_spin.setToolTip("PMU channel to pulse and measure (card 1: channels 1, 2; card 2: 3, 4; ...)")
+    @staticmethod
+    def _make_type_combo(selected: str = DEFAULT_MEASURE_TYPE) -> QtWidgets.QComboBox:
+        combo = QtWidgets.QComboBox()
+        combo.addItems(list(MEASURE_TYPES))
+        combo.setCurrentText(selected if selected in MEASURE_TYPES else DEFAULT_MEASURE_TYPE)
+        return combo
 
-        self.rpm_check = QtWidgets.QCheckBox("Configure RPM")
-        self.rpm_check.setChecked(True)
-        self.rpm_check.setToolTip("Enable when a 4225-RPM is connected to the channel")
+    def _fill_measure_cells(self):
+        """Add the measure type combo and the start/stop items to all rows that miss them."""
+        if self.table.columnCount() < len(TABLE_HEADERS):
+            return  # called by the base __init__ before the columns are added
+        blocked = self._block_cell_signals
+        self._block_cell_signals = True
+        for r in range(self.table.rowCount()):
+            if self.table.cellWidget(r, COL_MEAS_TYPE) is None:
+                self.table.setCellWidget(r, COL_MEAS_TYPE, self._make_type_combo())
+            for column in (COL_MEAS_START, COL_MEAS_STOP):
+                if self.table.item(r, column) is None:
+                    self.table.setItem(r, column, QtWidgets.QTableWidgetItem(""))
+        self._block_cell_signals = blocked
 
-        self.voltage_range_combo = QtWidgets.QComboBox()
-        self.voltage_range_combo.addItems(VOLTAGE_RANGES)
-        self.voltage_range_combo.setToolTip("Fixed voltage source range; must cover the largest absolute voltage")
+    def _add_empty_rows(self, n=10):
+        super()._add_empty_rows(n)
+        self._fill_measure_cells()
 
-        self.current_range_combo = QtWidgets.QComboBox()
-        self.current_range_combo.setEditable(True)
-        self.current_range_combo.addItems(CURRENT_RANGES)
-        self.current_range_combo.setCurrentText("1e-6")
-        self.current_range_combo.setToolTip("Fixed current measure range in A (SegArb requires a fixed range)")
+    def _ensure_trailing_empty_row(self):
+        super()._ensure_trailing_empty_row()
+        self._fill_measure_cells()
 
-        self.load_edit = QtWidgets.QLineEdit("1e6")
-        self.load_edit.setToolTip("DUT load resistance used for load-line correction, 1 to 1e7 Ohm")
+    def _on_insert_above(self):
+        super()._on_insert_above()
+        self._fill_measure_cells()
 
-        self.sample_rate_edit = QtWidgets.QLineEdit("200e6")
-        self.sample_rate_edit.setToolTip(
-            "A/D sample rate, 1e3 to 200e6 Sa/s. The instrument lowers it to keep within 65536 points."
+    def add_row(self, timestamp, voltage):
+        super().add_row(timestamp, voltage)
+        self._fill_measure_cells()
+
+    # ------------------------------------------------------------------
+    # Data access
+    # ------------------------------------------------------------------
+
+    def get_rows(self) -> list[tuple]:
+        """Return [(time, voltage, measure_type, measure_start, measure_stop), ...] for all valid points.
+
+        measure_type is the KXCI enum; measure_start/stop are None when left empty. Rows without a valid time and
+        voltage are skipped (like in get_pulse_data), an invalid measure start/stop raises a ValueError.
+        """
+        rows = []
+        for r in range(self.table.rowCount()):
+            try:
+                t = float(self.table.item(r, COL_TIME).text().strip())
+                v = float(self.table.item(r, COL_VOLTAGE).text().strip())
+            except Exception:
+                continue
+            combo = self.table.cellWidget(r, COL_MEAS_TYPE)
+            meas_type = MEASURE_TYPES[combo.currentText()] if combo else MEASURE_TYPES[DEFAULT_MEASURE_TYPE]
+            window = []
+            for column in (COL_MEAS_START, COL_MEAS_STOP):
+                item = self.table.item(r, column)
+                text = item.text().strip() if item else ""
+                try:
+                    window.append(float(text) if text else None)
+                except ValueError:
+                    raise ValueError(f"Row {r + 1}: '{TABLE_HEADERS[column]}' must be a number, got '{text}'.")
+            rows.append((t, v, meas_type, *window))
+        return rows
+
+    # ------------------------------------------------------------------
+    # CSV with all five columns
+    # ------------------------------------------------------------------
+
+    def _on_save_csv(self):
+        """Save all valid points including their measure settings to a CSV file."""
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self.table, "Save Sequence to CSV", CSV_DEFAULT_DIR, "CSV files (*.csv);;All files (*.*)"
         )
+        if not path:
+            return
+        try:
+            type_names = {value: name for name, value in MEASURE_TYPES.items()}
+            with open(path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(TABLE_HEADERS)
+                for t, v, meas_type, meas_start, meas_stop in self.get_rows():
+                    writer.writerow([
+                        "%1.6g" % t,
+                        "%1.6g" % v,
+                        type_names[meas_type],
+                        "" if meas_start is None else "%1.6g" % meas_start,
+                        "" if meas_stop is None else "%1.6g" % meas_stop,
+                    ])
+            self.csv_path = path
+        except Exception:
+            error()
 
-        grid = QtWidgets.QGridLayout(self)
-        grid.addWidget(QtWidgets.QLabel("Port"), 0, 0)
-        grid.addWidget(self.port_edit, 0, 1, 1, 3)
-        grid.addWidget(QtWidgets.QLabel("Channel"), 0, 4)
-        grid.addWidget(self.channel_spin, 0, 5)
-        grid.addWidget(self.rpm_check, 0, 6, 1, 2)
+    def load_csv(self, path) -> None:
+        """Load a sequence CSV, replacing the table contents.
 
-        grid.addWidget(QtWidgets.QLabel("Voltage range in V"), 1, 0)
-        grid.addWidget(self.voltage_range_combo, 1, 1)
-        grid.addWidget(QtWidgets.QLabel("Current range in A"), 1, 2)
-        grid.addWidget(self.current_range_combo, 1, 3)
-        grid.addWidget(QtWidgets.QLabel("Load in Ohm"), 1, 4)
-        grid.addWidget(self.load_edit, 1, 5)
-        grid.addWidget(QtWidgets.QLabel("Sample rate in Sa/s"), 1, 6)
-        grid.addWidget(self.sample_rate_edit, 1, 7)
+        Accepts the five-column format written by _on_save_csv and plain two-column (time, voltage) files of the
+        base Pulse Builder; missing measure settings get the defaults. Header and non-numeric lines are skipped.
+        """
+        try:
+            rows = []
+            with open(path, newline="") as f:
+                for row in csv.reader(f):
+                    if len(row) < 2:
+                        continue
+                    try:
+                        t, v = float(row[0].strip()), float(row[1].strip())
+                    except ValueError:
+                        continue  # skip header or non-numeric lines
+                    extra = [cell.strip() for cell in row[2:5]] + [""] * (3 - len(row[2:5]))
+                    rows.append((t, v, *extra))
+            if not rows:
+                return
 
-    def get_parameters(self) -> dict:
-        """Return the validated settings as plain Python values."""
+            self.table.setRowCount(0)
+            self._block_cell_signals = True
+            for t, v, meas_type, meas_start, meas_stop in rows:
+                r = self.table.rowCount()
+                self.table.insertRow(r)
+                self.table.setItem(r, COL_TIME, QtWidgets.QTableWidgetItem("%1.6g" % t))
+                self.table.setItem(r, COL_VOLTAGE, QtWidgets.QTableWidgetItem("%1.6g" % v))
+                self.table.setCellWidget(r, COL_MEAS_TYPE, self._make_type_combo(meas_type or DEFAULT_MEASURE_TYPE))
+                self.table.setItem(r, COL_MEAS_START, QtWidgets.QTableWidgetItem(meas_start))
+                self.table.setItem(r, COL_MEAS_STOP, QtWidgets.QTableWidgetItem(meas_stop))
+            self._block_cell_signals = False
+            self._ensure_trailing_empty_row()
+            self._emit_data_changed()
+            self.csv_path = path
+        except Exception:
+            error()
 
-        def to_float(text: str, name: str) -> float:
-            try:
-                return float(text.strip())
-            except ValueError:
-                raise ValueError(f"'{name}' must be a number, got '{text}'.") from None
 
-        port = self.port_edit.text().strip()
-        if not port:
-            raise ValueError("Please enter the KXCI port, e.g. TCPIP0::192.168.100.4::8888::SOCKET.")
+class KeithleySequenceTabWidget(SequenceTabWidget):
+    """SequenceTabWidget that instantiates KeithleyTableWidget instead of TableWidget."""
 
-        return {
-            "port": port,
-            "channel": self.channel_spin.value(),
-            "configure_rpm": self.rpm_check.isChecked(),
-            "voltage_range": int(self.voltage_range_combo.currentText()),
-            "current_range": to_float(self.current_range_combo.currentText(), "Current range in A"),
-            "load": to_float(self.load_edit.text(), "Load in Ohm"),
-            "sample_rate": to_float(self.sample_rate_edit.text(), "Sample rate in Sa/s"),
-        }
+    def add_sequence_tab(self):
+        seq_idx = self.sequence_count()
+        table = KeithleyTableWidget()
+        table.data_changed.connect(self._on_any_data_changed)
 
-    def get_setting(self) -> list[str]:
-        """Serialize the settings as "instrument_<key>: <value>" lines for the SweepMe! setting file."""
-        return [
-            f"instrument_port: {self.port_edit.text()}",
-            f"instrument_channel: {self.channel_spin.value()}",
-            f"instrument_configure_rpm: {self.rpm_check.isChecked()}",
-            f"instrument_voltage_range: {self.voltage_range_combo.currentText()}",
-            f"instrument_current_range: {self.current_range_combo.currentText()}",
-            f"instrument_load: {self.load_edit.text()}",
-            f"instrument_sample_rate: {self.sample_rate_edit.text()}",
-        ]
+        insert_pos = self.count() - 1 if self._plus_tab_added else self.count()
 
-    def set_setting(self, setting: list[str]) -> None:
-        """Restore the settings written by get_setting(); unknown or broken lines are skipped."""
-        for line in setting:
-            if not line.startswith("instrument_") or ":" not in line:
-                continue
-            key, value = line.split(":", 1)
-            key, value = key[len("instrument_"):], value.strip()
-            try:
-                if key == "port":
-                    self.port_edit.setText(value)
-                elif key == "channel":
-                    self.channel_spin.setValue(int(value))
-                elif key == "configure_rpm":
-                    self.rpm_check.setChecked(value == "True")
-                elif key == "voltage_range" and value in VOLTAGE_RANGES:
-                    self.voltage_range_combo.setCurrentText(value)
-                elif key == "current_range":
-                    self.current_range_combo.setCurrentText(value)
-                elif key == "load":
-                    self.load_edit.setText(value)
-                elif key == "sample_rate":
-                    self.sample_rate_edit.setText(value)
-            except ValueError:
-                continue
+        self.blockSignals(True)
+        self.insertTab(insert_pos, table, "Sequence %d" % (seq_idx + 1))
+        self.setTabIcon(insert_pos, _color_icon(_sequence_color(seq_idx)))
+        self.setCurrentIndex(insert_pos)
+        self.blockSignals(False)
+
+        self._hide_plus_close_button()
 
 
 class KeithleyPulseBuilderWidget(Widget):
-    """Pulse Builder with the 4200A-SCS instrument settings on top."""
+    """Pulse Builder using the sequence tables with measure columns."""
 
     def _create_layout(self):
-        self.instrument_settings = InstrumentSettingsWidget()
+        self.plot_widget = PlotWidget()
+        self.sequence_tabs = KeithleySequenceTabWidget(self)
+        self.waveform_table = WaveformTableWidget(self)
 
-        grid = super()._create_layout()
-        splitter = grid.itemAtPosition(0, 0).widget()
-        grid.removeWidget(splitter)
-        grid.addWidget(self.instrument_settings, 0, 0)
-        grid.addWidget(splitter, 1, 0)
-        grid.setRowStretch(1, 1)
+        # Top row: sequence plot (left) + sequence tabs (right); the tables are wider due to the measure columns
+        top_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        top_splitter.addWidget(self.plot_widget.seq_canvas)
+        top_splitter.addWidget(self.sequence_tabs)
+        top_splitter.setSizes([400, 500])
+
+        # Bottom row: waveform plot (left) + waveform table (right)
+        bot_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        bot_splitter.addWidget(self.plot_widget.wf_canvas)
+        bot_splitter.addWidget(self.waveform_table)
+        bot_splitter.setSizes([400, 500])
+
+        v_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        v_splitter.addWidget(top_splitter)
+        v_splitter.addWidget(bot_splitter)
+
+        grid = QtWidgets.QGridLayout()
+        grid.addWidget(v_splitter, 0, 0)
         return grid
-
-    def get_setting(self) -> list[str]:
-        return super().get_setting() + self.instrument_settings.get_setting()
-
-    def set_setting(self, setting: list[str]) -> None:
-        super().set_setting(setting)
-        self.instrument_settings.set_setting(setting)
 
 
 # ---------------------------------------------------------------------------
@@ -251,23 +371,25 @@ class Main():
     <h2>Pulse Builder &ndash; Keithley 4200A-SCS (SegArb via KXCI)</h2>
 
     <p>Draw pulse sequences in the Pulse Builder and play them on one PMU channel of a Keithley 4200A-SCS as a
-    <b>segmented arbitrary (SegArb) waveform</b>. Every segment is captured as a waveform, and the <b>voltage</b>,
-    <b>current</b> and <b>time</b> samples are returned as three equally long traces.</p>
+    <b>segmented arbitrary (SegArb) waveform</b>. The <b>voltage</b>, <b>current</b> and <b>time</b> samples of the
+    measured segments are returned as three equally long traces.</p>
 
     <p>Communication uses <b>KXCI</b> (Keithley External Control Interface) over a raw TCP/IP socket. KXCI must be
     enabled on the 4200A-SCS and the instrument reachable at the configured address before the run is started.</p>
 
-    <h3>Instrument settings</h3>
+    <h3>Arguments</h3>
     <ul>
     <li><b>Port</b> &ndash; VISA SOCKET address of the KXCI server, e.g.
     <code>TCPIP0::192.168.100.4::8888::SOCKET</code>.</li>
-    <li><b>Channel</b> &ndash; PMU channel to pulse and measure.</li>
-    <li><b>Configure RPM</b> &ndash; enable when a 4225-RPM is connected to the channel.</li>
-    <li><b>Voltage range in V</b> &ndash; <code>10</code> or <code>40</code>; must cover the largest absolute
+    <li><b>Channel</b> &ndash; PMU channel to pulse and measure (card 1: 1, 2; card 2: 3, 4; ...).</li>
+    <li><b>Voltage source range in V</b> &ndash; <code>10</code> or <code>40</code>; must cover the largest absolute
     voltage.</li>
-    <li><b>Current range in A</b> &ndash; fixed current measure range (SegArb requires a fixed range).</li>
+    <li><b>Current measure range in A</b> &ndash; fixed current range (SegArb requires a fixed range), e.g.
+    <code>1e-2</code>, <code>1e-4</code> or <code>1e-6</code>.</li>
     <li><b>Load in Ohm</b> &ndash; DUT resistance for load-line correction (instrument default 1e6).</li>
-    <li><b>Sample rate in Sa/s</b> &ndash; the instrument lowers it automatically to stay within 65536 points.</li>
+    <li><b>Sample rate in Sa/s</b> &ndash; 1e3 to 200e6; the instrument lowers it automatically to stay within 65536
+    points.</li>
+    <li><b>Configure RPM</b> &ndash; enable when a 4225-RPM is connected to the channel.</li>
     </ul>
 
     <h3>Defining the waveform</h3>
@@ -275,15 +397,19 @@ class Main():
     <li>Each <b>sequence tab</b> becomes one SegArb sequence. Its points are absolute times within the sequence and
     must start at 0&nbsp;s. Each pair of consecutive points is one segment (min. 20&nbsp;ns, 10&nbsp;ns
     resolution, max. 128 segments per sequence). Jumps need a finite rise/fall time.</li>
+    <li><b>Measure type</b>, <b>Measure start</b> and <b>Measure stop</b> of a row apply to the segment starting at
+    that point (they are ignored on the last point). Start and stop are relative to the segment start; empty means
+    0&nbsp;s and the segment end, i.e. the whole segment. Waveform and spot-mean types cannot be mixed in one
+    waveform.</li>
     <li>The <b>waveform table</b> sets the playback order and repetitions. Consecutive sequences &ndash; and repeated
     ones &ndash; must connect seamlessly: each sequence has to end at the start voltage of the next.</li>
-    <li>Every segment is measured over its full duration.</li>
     </ul>
 
     <h3>Notes</h3>
     <ul>
     <li>The sequences and the waveform table are stored in the setting via their CSV file paths. Save them to CSV
     before saving the setting.</li>
+    <li>Spot-mean results are read from the VH/IH/TH fields (one value per measured segment).</li>
     <li>Configuration errors reported by the instrument (KXCI error buffer) stop the run with the instrument's
     message.</li>
     <li>The Stop button aborts a running test; the data captured so far is returned.</li>
@@ -293,6 +419,16 @@ class Main():
 
     variables = ["Voltage", "Current", "Time"]
     units = ["V", "A", "s"]
+
+    arguments = {
+        "Port": "TCPIP0::192.168.100.4::8888::SOCKET",
+        "Channel": [1, 2, 3, 4, 5, 6, 7, 8],
+        "Voltage source range in V": ["10", "40"],
+        "Current measure range in A": 1e-6,
+        "Load in Ohm": 1e6,
+        "Sample rate in Sa/s": 200e6,
+        "Configure RPM": True,
+    }
 
     def __init__(self):
         self.widget = None
@@ -314,11 +450,11 @@ class Main():
         return self.widget
 
     def get_setting(self) -> list[str]:
-        """Return the CSV paths and instrument settings as list[str]."""
+        """Return the CSV save paths as list[str], if they exist."""
         return self.widget.get_setting()
 
     def set_setting(self, setting: list[str]) -> None:
-        """Restore the CSV paths and instrument settings."""
+        """Receive the CSV save paths and load them into the respective tables."""
         self.widget.set_setting(setting)
 
     # ------------------------------------------------------------------ #
@@ -367,19 +503,28 @@ class Main():
     # measurement
     # ------------------------------------------------------------------ #
 
-    def main(self):
-        parameters = self.widget.instrument_settings.get_parameters()
+    def main(self, **kwargs):
+        self.channel = channel = int(kwargs["Channel"])
+        voltage_range = int(kwargs["Voltage source range in V"])
+        current_range = float(kwargs["Current measure range in A"])
+        load = float(kwargs["Load in Ohm"])
+        sample_rate = float(kwargs["Sample rate in Sa/s"])
+        configure_rpm = bool(kwargs["Configure RPM"])
+
         sequences, sequence_list = self._read_waveform()
 
-        for _times, start_v, stop_v in sequences.values():
-            v_max = max(abs(v) for v in start_v + stop_v)
-            if v_max > parameters["voltage_range"]:
+        for seq_id, segments in sequences.items():
+            v_max = max(abs(v) for v in segments["start_v"] + segments["stop_v"])
+            if v_max > voltage_range:
                 raise ValueError(
-                    f"The waveform reaches {v_max:g} V, which exceeds the {parameters['voltage_range']} V source range."
+                    f"Sequence {seq_id} reaches {v_max:g} V, which exceeds the {voltage_range} V source range."
                 )
 
-        self.channel = channel = parameters["channel"]
-        self._ensure_connected(parameters["port"])
+        measure_types = {t for segments in sequences.values() for t in segments["meas_types"]} - {KXCIPMU.MEAS_NONE}
+        if measure_types & WAVEFORM_TYPES and measure_types & SPOT_MEAN_TYPES:
+            raise ValueError("Waveform and spot-mean measure types cannot be mixed in one waveform.")
+
+        self._ensure_connected(kwargs["Port"])
         pmu = self.pmu
 
         # Clear the KXCI error buffer so any error read later belongs to this run. Ethernet KXCI acknowledges every
@@ -389,36 +534,42 @@ class Main():
 
         # :PMU:INIT must come first - it also clears the data buffer and deletes any previously defined sequences.
         pmu.init(KXCIPMU.MODE_SEGARB)
-        if parameters["configure_rpm"]:
+        if configure_rpm:
             pmu.configure_rpm(self._rpm_hrid(channel), KXCIPMU.RPM_MODE_PMU)
         # SegArb requires fixed ranges for both voltage (source) and current (measure).
-        pmu.set_source_range(channel, parameters["voltage_range"])
-        pmu.set_measure_range(channel, KXCIPMU.RANGE_FIXED, parameters["current_range"])
-        pmu.set_load(channel, parameters["load"])
+        pmu.set_source_range(channel, voltage_range)
+        pmu.set_measure_range(channel, KXCIPMU.RANGE_FIXED, current_range)
+        pmu.set_load(channel, load)
 
         setup_error = self._read_error()
         if setup_error:
             raise RuntimeError(f"PMU channel setup (RPM/ranges/load) failed - instrument reports: {setup_error}")
 
-        # Define every used sequence; each segment is measured over its full duration.
-        for seq_id, (times, start_v, stop_v) in sequences.items():
-            pmu.set_segment_times(channel, seq_id, times)
-            pmu.set_start_voltages(channel, seq_id, start_v)
-            pmu.set_stop_voltages(channel, seq_id, stop_v)
-            pmu.set_measure_types(channel, seq_id, [KXCIPMU.MEAS_WAVEFORM_DISCRETE] * len(times))
-            pmu.set_measure_starts(channel, seq_id, [0.0] * len(times))
-            pmu.set_measure_stops(channel, seq_id, times)
+        for seq_id, segments in sequences.items():
+            pmu.set_segment_times(channel, seq_id, segments["times"])
+            pmu.set_start_voltages(channel, seq_id, segments["start_v"])
+            pmu.set_stop_voltages(channel, seq_id, segments["stop_v"])
+            pmu.set_measure_types(channel, seq_id, segments["meas_types"])
+            pmu.set_measure_starts(channel, seq_id, segments["meas_starts"])
+            pmu.set_measure_stops(channel, seq_id, segments["meas_stops"])
 
         pmu.set_sequence_list(channel, sequence_list)
-        pmu.set_sample_rate(parameters["sample_rate"])
+        pmu.set_sample_rate(sample_rate)
 
-        total_duration = sum(sum(sequences[seq_id][0]) * reps for seq_id, reps in sequence_list)
+        total_duration = sum(sum(sequences[seq_id]["times"]) * reps for seq_id, reps in sequence_list)
 
         try:
             pmu.set_output_state(channel, KXCIPMU.OUTPUT_ON)
             pmu.execute()
             self._wait_until_idle(timeout=2 * total_duration + START_TIMEOUT_S)
-            voltage, current, timestamp = pmu.read_voltage_current_time(channel)
+            if not measure_types:
+                voltage, current, timestamp = [], [], []
+            elif measure_types & SPOT_MEAN_TYPES:
+                voltage = pmu.read_value(channel, "VH")
+                current = pmu.read_value(channel, "IH")
+                timestamp = pmu.read_value(channel, "TH")
+            else:
+                voltage, current, timestamp = pmu.read_voltage_current_time(channel)
         finally:
             # Always turn the output off, even if the run or readback fails.
             pmu.set_output_state(channel, KXCIPMU.OUTPUT_OFF)
@@ -433,10 +584,9 @@ class Main():
         """Convert the Pulse Builder content into SegArb sequences and the sequence list.
 
         Returns:
-            sequences: {seq_id: (times, start_voltages, stop_voltages)} for every sequence used in the waveform.
+            sequences: {seq_id: segment arrays of build_segments()} for every sequence used in the waveform.
             sequence_list: [(seq_id, repetitions), ...] in playback order.
         """
-        all_sequences = self.widget.sequence_tabs.get_all_sequences()
         sequence_list = self.widget.waveform_table.get_waveform_data()
         if not sequence_list:
             raise ValueError("The waveform table is empty. Add at least one row (sequence ID, repetitions).")
@@ -444,8 +594,11 @@ class Main():
         sequences = {}
         for seq_id, _reps in sequence_list:
             if seq_id not in sequences:
-                xs, ys = all_sequences[seq_id - 1]
-                sequences[seq_id] = build_segments(seq_id, xs, ys)
+                try:
+                    rows = self.widget.sequence_tabs.widget(seq_id - 1).get_rows()
+                except ValueError as e:
+                    raise ValueError(f"Sequence {seq_id}: {e}") from None
+                sequences[seq_id] = build_segments(seq_id, rows)
 
         check_sequence_list(sequences, sequence_list)
         return sequences, sequence_list
@@ -468,10 +621,10 @@ class Main():
         error/polling paths.
         """
         try:
-            error = self.pmu.get_last_error().strip()
+            message = self.pmu.get_last_error().strip()
         except Exception:
             return ""
-        return error if "(-" in error else ""
+        return message if "(-" in message else ""
 
     def _stop_requested(self) -> bool:
         """True when the user pressed Stop in SweepMe!.
@@ -497,10 +650,10 @@ class Main():
                 return  # started and finished faster than we could poll; data is already buffered
             # If the final verification of EXECUTE failed (e.g. -951), the test never arms and the error is only in
             # the KXCI error buffer.
-            error = self._read_error()
-            if error:
+            message = self._read_error()
+            if message:
                 self.pmu.abort()
-                raise RuntimeError(f"SegArb test failed to arm - instrument reports: {error}")
+                raise RuntimeError(f"SegArb test failed to arm - instrument reports: {message}")
             if self._stop_requested():
                 self.pmu.abort()
                 return
