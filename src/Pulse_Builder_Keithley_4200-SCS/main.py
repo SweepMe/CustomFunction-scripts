@@ -45,7 +45,7 @@ MAX_SEGMENTS_PER_SEQUENCE = 128  # one :PMU:SARB:SEQ:* call; the ...:ADD variant
 
 START_TIMEOUT_S = 10.0  # max. time between :PMU:EXECUTE and the test reporting RUNNING
 
-# Measure types of :PMU:SARB:SEQ:MEAS:TYPE, applied to all segments with "Measure" = 1
+# Measure types of :PMU:SARB:SEQ:MEAS:TYPE, applied to all segments with "Measure" checked
 MEASURE_TYPES = {
     "Waveform discrete": KXCIPMU.MEAS_WAVEFORM_DISCRETE,
     "Waveform average": KXCIPMU.MEAS_WAVEFORM_AVERAGE,
@@ -59,20 +59,21 @@ SPOT_MEAN_TYPES = {KXCIPMU.MEAS_SPOT_MEAN_DISCRETE, KXCIPMU.MEAS_SPOT_MEAN_AVERA
     COL_START_V, COL_STOP_V, COL_TIME, COL_MEASURE, COL_MEAS_START, COL_MEAS_STOP, COL_SSR, COL_TRIGGER,
 ) = range(8)
 SEGMENT_HEADERS = [
-    "Start voltage in V", "Stop voltage in V", "Segment time in s", "Measure (0/1)",
-    "Measure start in s", "Measure stop in s", "SSR (0/1)", "Trigger out (0/1)",
+    "Start voltage in V", "Stop voltage in V", "Segment time in s", "Measure",
+    "Measure start in s", "Measure stop in s", "SSR", "Trigger out",
 ]
 SEGMENT_TOOLTIPS = [
     "Voltage at the start of the segment; must equal the stop voltage of the previous segment",
     "Voltage at the end of the segment",
     f"Duration of the segment, min. {SEGMENT_TIME_MIN:g} s in steps of {SEGMENT_TIME_RESOLUTION:g} s",
-    "1 = measure this segment with the selected measure type, 0 = no measurement",
+    "Checked = measure this segment with the selected measure type",
     "Start of the measurement relative to the segment start; empty = 0 s",
     "Stop of the measurement relative to the segment start; empty = end of the segment",
-    "1 = output relay closed (segment is output), 0 = open (output floating); relay transitions need >= 25 us",
-    "1 = trigger output high during this segment, 0 = low",
+    "Checked = output relay closed (segment is output), unchecked = open (output floating); relay transitions need "
+    ">= 25 us",
+    "Checked = trigger output high during this segment, unchecked = low",
 ]
-FLAG_COLUMNS = {COL_MEASURE: 1, COL_SSR: 1, COL_TRIGGER: 0}  # column -> default when left empty
+FLAG_COLUMNS = {COL_MEASURE: 1, COL_SSR: 1, COL_TRIGGER: 0}  # checkbox column -> default state of a new row
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +238,12 @@ class SegmentTableWidget(QtWidgets.QWidget):
     def _insert_empty_row(self, row: int) -> None:
         self.table.insertRow(row)
         for column in range(self.table.columnCount()):
-            self.table.setItem(row, column, QtWidgets.QTableWidgetItem(""))
+            item = QtWidgets.QTableWidgetItem("")
+            if column in FLAG_COLUMNS:
+                # Checkbox cell: checkable but not text-editable, pre-set to the default state
+                item.setFlags(QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
+                item.setCheckState(QtCore.Qt.Checked if FLAG_COLUMNS[column] else QtCore.Qt.Unchecked)
+            self.table.setItem(row, column, item)
 
     def _add_empty_rows(self, n=10):
         self._block_cell_signals = True
@@ -246,7 +252,9 @@ class SegmentTableWidget(QtWidgets.QWidget):
         self._block_cell_signals = False
 
     def _row_is_empty(self, r) -> bool:
-        return all(self._text(r, column) == "" for column in range(self.table.columnCount()))
+        """True if no text cell is filled; the checkbox columns always have a state and do not count."""
+        return all(self._text(r, column) == "" for column in range(self.table.columnCount())
+                   if column not in FLAG_COLUMNS)
 
     def _ensure_trailing_empty_row(self):
         rows = self.table.rowCount()
@@ -288,6 +296,13 @@ class SegmentTableWidget(QtWidgets.QWidget):
         item = self.table.item(r, column)
         return item.text().strip() if item is not None else ""
 
+    def _is_checked(self, r, column) -> bool:
+        item = self.table.item(r, column)
+        return item is not None and item.checkState() == QtCore.Qt.Checked
+
+    def _set_checked(self, r, column, checked: bool) -> None:
+        self.table.item(r, column).setCheckState(QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked)
+
     def _on_cell_changed(self, row, column):
         if self._block_cell_signals:
             return
@@ -299,14 +314,9 @@ class SegmentTableWidget(QtWidgets.QWidget):
                 self.table.item(row, column).setText("%1.6g" % float(text))
             except ValueError:
                 pass  # flagged by _refresh
-        if not self._row_is_empty(row):
-            # Show the defaults of the 0/1 columns explicitly once a segment is started
-            for flag_column, default in FLAG_COLUMNS.items():
-                if self._text(row, flag_column) == "":
-                    self.table.item(row, flag_column).setText(str(default))
-            # Continue the waveform seamlessly: pre-fill the next start voltage with this stop voltage
-            if column == COL_STOP_V and row + 1 < self.table.rowCount() and self._text(row + 1, COL_START_V) == "":
-                self.table.item(row + 1, COL_START_V).setText(self._text(row, COL_STOP_V))
+        # Continue the waveform seamlessly: pre-fill the next start voltage with this stop voltage
+        if column == COL_STOP_V and text and row + 1 < self.table.rowCount() and self._text(row + 1, COL_START_V) == "":
+            self.table.item(row + 1, COL_START_V).setText(self._text(row, COL_STOP_V))
         self._block_cell_signals = False
 
         self._ensure_trailing_empty_row()
@@ -319,7 +329,8 @@ class SegmentTableWidget(QtWidgets.QWidget):
         problems is a list of (column, message) covering parse errors and the SegArb rules (except the seamless
         check, which needs the previous segment).
         """
-        if all(self._text(r, column) == "" for column in range(self.table.columnCount()) if column != COL_START_V):
+        if all(self._text(r, column) == "" for column in range(self.table.columnCount())
+               if column != COL_START_V and column not in FLAG_COLUMNS):
             return None, []  # empty, or only the pre-filled start voltage of a segment not started yet
 
         problems = []
@@ -336,13 +347,7 @@ class SegmentTableWidget(QtWidgets.QWidget):
             except ValueError:
                 problems.append((column, f"'{SEGMENT_HEADERS[column]}' must be a number or empty."))
         for key, column in (("measure", COL_MEASURE), ("ssr", COL_SSR), ("trigger", COL_TRIGGER)):
-            text = self._text(r, column)
-            if text == "":
-                values[key] = FLAG_COLUMNS[column]
-            elif text in ("0", "1"):
-                values[key] = int(text)
-            else:
-                problems.append((column, f"'{SEGMENT_HEADERS[column]}' must be 0 or 1."))
+            values[key] = int(self._is_checked(r, column))
 
         if problems:
             return None, problems
@@ -414,7 +419,7 @@ class SegmentTableWidget(QtWidgets.QWidget):
     # ------------------------------------------------------------------
 
     def _on_save_csv(self):
-        """Save all non-empty segment rows to a CSV file."""
+        """Save all non-empty segment rows to a CSV file; the checkbox columns are written as 0/1."""
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self.table, "Save Sequence to CSV", CSV_DEFAULT_DIR, "CSV files (*.csv);;All files (*.*)"
         )
@@ -426,7 +431,10 @@ class SegmentTableWidget(QtWidgets.QWidget):
                 writer.writerow(SEGMENT_HEADERS)
                 for r in range(self.table.rowCount()):
                     if not self._row_is_empty(r):
-                        writer.writerow([self._text(r, column) for column in range(self.table.columnCount())])
+                        writer.writerow([
+                            str(int(self._is_checked(r, column))) if column in FLAG_COLUMNS else self._text(r, column)
+                            for column in range(self.table.columnCount())
+                        ])
             self.csv_path = path
         except Exception:
             error()
@@ -442,7 +450,8 @@ class SegmentTableWidget(QtWidgets.QWidget):
     def load_csv(self, path) -> None:
         """Load segments from a CSV file (columns as in the table), replacing the table contents.
 
-        The header and any line whose first cell is not a number are skipped; missing trailing columns stay empty.
+        The header and any line whose first cell is not a number are skipped. The checkbox columns are read as 0/1;
+        missing trailing columns stay empty or keep their default state.
         """
         try:
             rows = []
@@ -462,7 +471,11 @@ class SegmentTableWidget(QtWidgets.QWidget):
                 r = self.table.rowCount()
                 self._insert_empty_row(r)
                 for column, text in enumerate(cells):
-                    self.table.item(r, column).setText(text)
+                    if column in FLAG_COLUMNS:
+                        if text in ("0", "1"):
+                            self._set_checked(r, column, text == "1")
+                    else:
+                        self.table.item(r, column).setText(text)
             self._block_cell_signals = False
             self._ensure_trailing_empty_row()
             self._refresh()
@@ -544,7 +557,7 @@ class Main():
     first pulse card.</li>
     <li><b>Channel</b> &ndash; channel on that card, 1 or 2. KXCI numbers the channels across all cards (PMU1: 1,
     2; PMU2: 3, 4; ...); the script converts card and channel accordingly.</li>
-    <li><b>Measure type</b> &ndash; applied to every segment with <i>Measure</i> = 1: waveform (all samples) or spot
+    <li><b>Measure type</b> &ndash; applied to every segment with <i>Measure</i> checked: waveform (all samples) or spot
     mean (one value per segment), each discrete or averaged over the repetitions.</li>
     <li><b>Voltage source range in V</b> &ndash; <code>10</code> or <code>40</code>; must cover the largest absolute
     voltage.</li>
@@ -564,11 +577,12 @@ class Main():
     start voltage must equal the stop voltage of the previous segment (it is pre-filled when you enter a stop
     voltage).</li>
     <li><b>Segment time in s</b> &ndash; min. 20&nbsp;ns, in steps of 10&nbsp;ns.</li>
-    <li><b>Measure (0/1)</b> &ndash; measure this segment with the selected measure type. <b>Measure start/stop in
+    <li><b>Measure</b> &ndash; check to measure this segment with the selected measure type. <b>Measure start/stop in
     s</b> optionally limit the measurement to a window relative to the segment start; empty means the whole
     segment.</li>
-    <li><b>SSR (0/1)</b> &ndash; 1 closes the output relay, 0 leaves the output floating (relay transitions need
-    at least 25&nbsp;&micro;s). <b>Trigger out (0/1)</b> &ndash; level of the trigger output during the segment.</li>
+    <li><b>SSR</b> &ndash; checked closes the output relay, unchecked leaves the output floating (relay transitions
+    need at least 25&nbsp;&micro;s). <b>Trigger out</b> &ndash; checked sets the trigger output high during the
+    segment.</li>
     <li>Invalid cells are highlighted in red; hover over them for the reason.</li>
     <li>The <b>waveform table</b> sets the playback order and repetitions. Consecutive sequences &ndash; and repeated
     ones &ndash; must connect seamlessly: each sequence has to end at the start voltage of the next.</li>
