@@ -1,5 +1,18 @@
 import csv
-from PySide6 import QtWidgets, QtGui, QtCore
+import sys
+
+# SweepMe! 1.6.1 and newer ship PySide6, SweepMe! 1.5.x ships PySide2. Use the binding the running SweepMe! has
+# already loaded; otherwise (e.g. standalone) the first one available. Scripts can import QtWidgets, QtGui and QtCore
+# from here to stay on the same binding.
+if "PySide2" in sys.modules and "PySide6" not in sys.modules:
+    from PySide2 import QtWidgets, QtGui, QtCore
+else:
+    try:
+        from PySide6 import QtWidgets, QtGui, QtCore
+    except ImportError:
+        from PySide2 import QtWidgets, QtGui, QtCore
+
+# backend_qtagg (matplotlib >= 3.5) uses whichever Qt binding is imported above
 from matplotlib import pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT

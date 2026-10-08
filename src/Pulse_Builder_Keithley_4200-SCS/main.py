@@ -15,7 +15,6 @@ import csv
 import time
 
 import numpy as np
-from PySide6 import QtCore, QtGui, QtWidgets
 
 from pysweepme import FolderManager, Ports
 from pysweepme.ErrorMessage import error
@@ -27,7 +26,11 @@ import kxci_pmu
 importlib.reload(kxci_pmu)
 
 from kxci_pmu import KXCIPMU
+# The Qt binding (PySide6 for SweepMe! 1.6.1+, PySide2 for SweepMe! 1.5.x) is chosen in pulse_builder
 from pulse_builder import (
+    QtCore,
+    QtGui,
+    QtWidgets,
     Widget,
     PlotWidget,
     SequenceTabWidget,
@@ -590,6 +593,7 @@ class Main():
 
     <h3>Notes</h3>
     <ul>
+    <li>Runs with SweepMe! 1.6.1 and newer (PySide6) as well as SweepMe! 1.5.x (PySide2).</li>
     <li>The sequences and the waveform table are stored in the setting via their CSV file paths. Save them to CSV
     before saving the setting.</li>
     <li>Spot-mean results are read from the VH/IH/TH fields (one value per measured segment).</li>
@@ -871,4 +875,4 @@ if __name__ == "__main__":
     app = QtWidgets.QApplication([])
     script = Main()
     script.renew_widget().show()
-    app.exec()
+    app.exec() if hasattr(app, "exec") else app.exec_()  # PySide2 only has exec_()
