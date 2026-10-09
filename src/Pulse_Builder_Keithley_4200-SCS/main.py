@@ -48,6 +48,10 @@ MAX_SEGMENTS_PER_SEQUENCE = 128  # one :PMU:SARB:SEQ:* call; the ...:ADD variant
 
 START_TIMEOUT_S = 10.0  # max. time between :PMU:EXECUTE and the test reporting RUNNING
 
+# Minimum slew rate of a ramp in V/s per voltage source range (LPT manual, pulse_rise/pulse_fall: 362 uV/us for the
+# 10 V high-speed range, 1.8 mV/us for the 40 V high-voltage range). Slower ramps fail with KXCI error -959.
+MIN_SLEW_RATE = {10: 362.0, 40: 1800.0}
+
 # Measure types of :PMU:SARB:SEQ:MEAS:TYPE, applied to all segments with "Measure" checked
 MEASURE_TYPES = {
     "Waveform discrete": KXCIPMU.MEAS_WAVEFORM_DISCRETE,
@@ -155,6 +159,23 @@ def build_segments(sequence_number: int, segments: list[dict], measure_type: int
         arrays["trig"].append(segment["trigger"])
 
     return arrays
+
+
+def check_slew_rates(sequences: dict, voltage_range: int) -> None:
+    """Check that every ramp is at least as steep as the minimum slew rate of the voltage source range.
+
+    The pulse card cannot generate arbitrarily slow ramps; flat segments (start = stop voltage) are not affected.
+    """
+    min_slew = MIN_SLEW_RATE[voltage_range]
+    for seq_id, arrays in sequences.items():
+        for i, (duration, start_v, stop_v) in enumerate(zip(arrays["times"], arrays["start_v"], arrays["stop_v"])):
+            delta_v = abs(stop_v - start_v)
+            if delta_v and delta_v / duration < min_slew:
+                raise ValueError(
+                    f"Sequence {seq_id}, segment {i + 1}: the ramp from {start_v:g} V to {stop_v:g} V in "
+                    f"{duration:g} s is {delta_v / duration:g} V/s, below the minimum slew rate of {min_slew:g} V/s "
+                    f"of the {voltage_range} V range. Make the segment at most {delta_v / min_slew:.3g} s long."
+                )
 
 
 def check_sequence_list(sequences: dict, sequence_list: list[tuple[int, int]]) -> None:
@@ -579,7 +600,9 @@ class Main():
     <li><b>Start/Stop voltage in V</b> &ndash; the voltage ramps linearly from start to stop over the segment. The
     start voltage must equal the stop voltage of the previous segment (it is pre-filled when you enter a stop
     voltage).</li>
-    <li><b>Segment time in s</b> &ndash; min. 20&nbsp;ns, in steps of 10&nbsp;ns.</li>
+    <li><b>Segment time in s</b> &ndash; min. 20&nbsp;ns, in steps of 10&nbsp;ns. Ramps must not be too slow: the
+    minimum slew rate is 362&nbsp;V/s (1&nbsp;V in 2.7&nbsp;ms) on the 10&nbsp;V range and 1800&nbsp;V/s
+    (1&nbsp;V in 500&nbsp;&micro;s) on the 40&nbsp;V range.</li>
     <li><b>Measure</b> &ndash; check to measure this segment with the selected measure type. <b>Measure start/stop in
     s</b> optionally limit the measurement to a window relative to the segment start; empty means the whole
     segment.</li>
@@ -712,6 +735,7 @@ class Main():
                 raise ValueError(
                     f"Sequence {seq_id} reaches {v_max:g} V, which exceeds the {voltage_range} V source range."
                 )
+        check_slew_rates(sequences, voltage_range)
         is_measured = any(t != KXCIPMU.MEAS_NONE for arrays in sequences.values() for t in arrays["meas_types"])
 
         self._ensure_connected(kwargs["Port"])
