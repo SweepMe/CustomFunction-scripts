@@ -746,6 +746,18 @@ class Main():
         self._ensure_connected(kwargs["Port"])
         pmu = self.pmu
 
+        # *OPT? lists the slot configuration as KCon sees it, e.g. "PMU1RPM1-2" for an RPM on both channels of PMU1.
+        # Configuring an RPM that the instrument does not know about must be avoided: it silently falls back to the
+        # PMU current ranges, and the SegArb test was seen to stay RUNNING without output until :PMU:ABORT.
+        options = self.port.query("*OPT?").strip()
+        print(f"4200A-SCS configuration (*OPT?): {options}")
+        if configure_rpm and "RPM" not in options.upper():
+            raise ValueError(
+                f"'Configure RPM' is checked, but the 4200A-SCS reports no RPM in its configuration (*OPT?: "
+                f"{options}). Uncheck 'Configure RPM' for a direct PMU connection, or add the RPM in KCon "
+                f"('Update Preamp, RPM, and CVIV Configuration' and save)."
+            )
+
         # Clear the KXCI error buffer so any error read later belongs to this run. Ethernet KXCI acknowledges every
         # command with ACK on receipt; real errors (e.g. -951 from the final verification in EXECUTE) land only in
         # this buffer and on the instrument's console.
@@ -899,10 +911,12 @@ class Main():
                 return  # return the data captured so far
             if time.time() - start > timeout:
                 self.pmu.abort()
+                message = self._read_error() or "none"
                 raise TimeoutError(
                     f"SegArb test still running after {timeout:g} s (data points so far: "
-                    f"{self.pmu.get_data_count(self.channel)}). Increase 'Timeout in s' if the instrument needs longer "
-                    f"to prepare the waveform."
+                    f"{self.pmu.get_data_count(self.channel)}, last KXCI error: {message}). If no output was "
+                    f"generated, check that 'Configure RPM' matches the hardware and the ranges are available; "
+                    f"otherwise increase 'Timeout in s'."
                 )
             if time.time() >= next_print:
                 print(f"SegArb: running ... {time.time() - start:.1f} s, data points: "
