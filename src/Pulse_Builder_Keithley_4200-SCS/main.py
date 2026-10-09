@@ -181,10 +181,10 @@ def check_slew_rates(sequences: dict, voltage_range: int) -> None:
 
 
 def check_sequence_list(sequences: dict, sequence_list: list[tuple[int, int]]) -> None:
-    """Check that the playback order yields a seamless waveform.
+    """Check that the playback order yields a seamless waveform that the pulse card starts.
 
     SegArb requires the stop voltage of each sequence to equal the start voltage of the next one - also between
-    two repetitions of the same sequence.
+    two repetitions of the same sequence - and the first played segment must have its trigger output high.
     """
     previous = None
     for seq_id, reps in sequence_list:
@@ -200,6 +200,15 @@ def check_sequence_list(sequences: dict, sequence_list: list[tuple[int, int]]) -
                 f"{seq_id} starts at {start_v:g} V. Consecutive sequences must connect seamlessly."
             )
         previous = seq_id
+
+    # Verified on hardware (4200A-SCS, Clarius V1.14.1): the PMU only starts the waveform when the trigger output of
+    # the first played segment is high. Otherwise :PMU:TEST:STATUS? stays RUNNING without output until :PMU:ABORT.
+    first_seq = sequence_list[0][0]
+    if sequences[first_seq]["trig"][0] != KXCIPMU.TRIG_HIGH:
+        raise ValueError(
+            f"'Trigger out' must be checked for the first segment of sequence {first_seq}, the first segment of the "
+            f"waveform. The pulse card does not start the waveform when its trigger output starts low."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -613,7 +622,8 @@ class Main():
     segment.</li>
     <li><b>SSR</b> &ndash; checked closes the output relay, unchecked leaves the output floating (relay transitions
     need at least 25&nbsp;&micro;s). <b>Trigger out</b> &ndash; checked sets the trigger output high during the
-    segment. Both default to checked, the instrument's reset state; they are only sent when a segment differs.</li>
+    segment. Both default to checked, the instrument's reset state; they are only sent when a segment differs. The
+    first segment of the waveform must keep <b>Trigger out</b> checked, otherwise the pulse card does not start.</li>
     <li>Invalid cells are highlighted in red; hover over them for the reason.</li>
     <li>The <b>waveform table</b> sets the playback order and repetitions. Consecutive sequences &ndash; and repeated
     ones &ndash; must connect seamlessly: each sequence has to end at the start voltage of the next.</li>
@@ -786,7 +796,7 @@ class Main():
             pmu.set_measure_starts(channel, seq_id, arrays["meas_starts"])
             pmu.set_measure_stops(channel, seq_id, arrays["meas_stops"])
             # Like the KXCI manual example, leave the relay and trigger arrays at their reset defaults (all closed,
-            # all high) unless the user changed them. Suspected cause of a test that stayed RUNNING without output.
+            # all high) unless the user changed them.
             if any(state != KXCIPMU.SSR_CLOSED for state in arrays["ssr"]):
                 pmu.set_ssr(channel, seq_id, arrays["ssr"])
             if any(state != KXCIPMU.TRIG_HIGH for state in arrays["trig"]):
