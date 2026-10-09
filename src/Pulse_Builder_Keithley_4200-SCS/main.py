@@ -80,7 +80,9 @@ SEGMENT_TOOLTIPS = [
     ">= 25 us",
     "Checked = trigger output high during this segment, unchecked = low",
 ]
-FLAG_COLUMNS = {COL_MEASURE: 1, COL_SSR: 1, COL_TRIGGER: 0}  # checkbox column -> default state of a new row
+# Checkbox column -> default state of a new row. SSR and Trigger out default to the instrument's reset state (relay
+# closed, trigger high).
+FLAG_COLUMNS = {COL_MEASURE: 1, COL_SSR: 1, COL_TRIGGER: 1}
 
 
 # ---------------------------------------------------------------------------
@@ -611,7 +613,7 @@ class Main():
     segment.</li>
     <li><b>SSR</b> &ndash; checked closes the output relay, unchecked leaves the output floating (relay transitions
     need at least 25&nbsp;&micro;s). <b>Trigger out</b> &ndash; checked sets the trigger output high during the
-    segment.</li>
+    segment. Both default to checked, the instrument's reset state; they are only sent when a segment differs.</li>
     <li>Invalid cells are highlighted in red; hover over them for the reason.</li>
     <li>The <b>waveform table</b> sets the playback order and repetitions. Consecutive sequences &ndash; and repeated
     ones &ndash; must connect seamlessly: each sequence has to end at the start voltage of the next.</li>
@@ -783,8 +785,12 @@ class Main():
             pmu.set_measure_types(channel, seq_id, arrays["meas_types"])
             pmu.set_measure_starts(channel, seq_id, arrays["meas_starts"])
             pmu.set_measure_stops(channel, seq_id, arrays["meas_stops"])
-            pmu.set_ssr(channel, seq_id, arrays["ssr"])
-            pmu.set_triggers(channel, seq_id, arrays["trig"])
+            # Like the KXCI manual example, leave the relay and trigger arrays at their reset defaults (all closed,
+            # all high) unless the user changed them. Suspected cause of a test that stayed RUNNING without output.
+            if any(state != KXCIPMU.SSR_CLOSED for state in arrays["ssr"]):
+                pmu.set_ssr(channel, seq_id, arrays["ssr"])
+            if any(state != KXCIPMU.TRIG_HIGH for state in arrays["trig"]):
+                pmu.set_triggers(channel, seq_id, arrays["trig"])
 
         pmu.set_sequence_list(channel, sequence_list)
         pmu.set_sample_rate(sample_rate)
