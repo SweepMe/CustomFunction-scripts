@@ -591,6 +591,9 @@ class Main():
     <li><b>Sample rate in Sa/s</b> &ndash; 1e3 to 200e6; the instrument lowers it automatically to stay within 65536
     points.</li>
     <li><b>Configure RPM</b> &ndash; enable when a 4225-RPM is connected to the channel.</li>
+    <li><b>Timeout in s</b> &ndash; maximum time from starting the test until it has finished. The instrument can
+    need considerably longer to prepare the waveform than the waveform itself lasts; the progress is printed to the
+    debug widget (F2).</li>
     </ul>
 
     <h3>Defining the waveform</h3>
@@ -640,6 +643,7 @@ class Main():
         "Load in Ohm": 1e6,
         "Sample rate in Sa/s": 200e6,
         "Configure RPM": True,
+        "Timeout in s": 60.0,
     }
 
     def __init__(self):
@@ -726,6 +730,7 @@ class Main():
         load = float(kwargs["Load in Ohm"])
         sample_rate = float(kwargs["Sample rate in Sa/s"])
         configure_rpm = bool(kwargs["Configure RPM"])
+        timeout = float(kwargs["Timeout in s"])
 
         sequences, sequence_list = self._read_waveform(measure_type)
 
@@ -777,7 +782,8 @@ class Main():
         try:
             pmu.set_output_state(channel, KXCIPMU.OUTPUT_ON)
             pmu.execute()
-            self._wait_until_idle(timeout=2 * total_duration + START_TIMEOUT_S)
+            # The test must also have time to play the waveform itself, however short the timeout is set
+            self._wait_until_idle(timeout=max(timeout, 2 * total_duration))
             if not is_measured:
                 voltage, current, timestamp = [], [], []
             elif measure_type in SPOT_MEAN_TYPES:
@@ -882,15 +888,30 @@ class Main():
                 )
             time.sleep(0.02)
 
-        # Phase 2: wait for the run to finish.
+        print(f"SegArb: RUNNING after {time.time() - start:.2f} s")
+
+        # Phase 2: wait for the run to finish. The status stays RUNNING while the instrument prepares the output, which
+        # can take much longer than the waveform itself, so the progress is logged to the debug widget (F2).
+        next_print = start + 1.0
         while self.pmu.get_test_status() == KXCIPMU.STATUS_RUNNING:
             if self._stop_requested():
                 self.pmu.abort()
                 return  # return the data captured so far
             if time.time() - start > timeout:
                 self.pmu.abort()
-                raise TimeoutError(f"SegArb test exceeded the timeout of {timeout:g} s.")
+                raise TimeoutError(
+                    f"SegArb test still running after {timeout:g} s (data points so far: "
+                    f"{self.pmu.get_data_count(self.channel)}). Increase 'Timeout in s' if the instrument needs longer "
+                    f"to prepare the waveform."
+                )
+            if time.time() >= next_print:
+                print(f"SegArb: running ... {time.time() - start:.1f} s, data points: "
+                      f"{self.pmu.get_data_count(self.channel)}")
+                next_print = time.time() + 1.0
             time.sleep(poll_interval)
+
+        print(f"SegArb: finished after {time.time() - start:.2f} s, data points: "
+              f"{self.pmu.get_data_count(self.channel)}")
 
 
 if __name__ == "__main__":
