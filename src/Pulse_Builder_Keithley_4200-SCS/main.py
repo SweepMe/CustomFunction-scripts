@@ -602,9 +602,7 @@ class Main():
     <li><b>Sample rate in Sa/s</b> &ndash; 1e3 to 200e6; the instrument lowers it automatically to stay within 65536
     points.</li>
     <li><b>Configure RPM</b> &ndash; enable when a 4225-RPM is connected to the channel.</li>
-    <li><b>Timeout in s</b> &ndash; maximum time from starting the test until it has finished. The instrument can
-    need considerably longer to prepare the waveform than the waveform itself lasts; the progress is printed to the
-    debug widget (F2).</li>
+    <li><b>Timeout in s</b> &ndash; maximum time from starting the test until it has finished.</li>
     </ul>
 
     <h3>Defining the waveform</h3>
@@ -760,9 +758,8 @@ class Main():
 
         # *OPT? lists the slot configuration as KCon sees it, e.g. "PMU1RPM1-2" for an RPM on both channels of PMU1.
         # Configuring an RPM that the instrument does not know about must be avoided: it silently falls back to the
-        # PMU current ranges, and the SegArb test was seen to stay RUNNING without output until :PMU:ABORT.
+        # PMU current ranges.
         options = self.port.query("*OPT?").strip()
-        print(f"4200A-SCS configuration (*OPT?): {options}")
         if configure_rpm and "RPM" not in options.upper():
             raise ValueError(
                 f"'Configure RPM' is checked, but the 4200A-SCS reports no RPM in its configuration (*OPT?: "
@@ -916,11 +913,7 @@ class Main():
                 )
             time.sleep(0.02)
 
-        print(f"SegArb: RUNNING after {time.time() - start:.2f} s")
-
-        # Phase 2: wait for the run to finish. The status stays RUNNING while the instrument prepares the output, which
-        # can take much longer than the waveform itself, so the progress is logged to the debug widget (F2).
-        next_print = start + 1.0
+        # Phase 2: wait for the run to finish.
         while self.pmu.get_test_status() == KXCIPMU.STATUS_RUNNING:
             if self._stop_requested():
                 self.pmu.abort()
@@ -931,17 +924,10 @@ class Main():
                 raise TimeoutError(
                     f"SegArb test still running after {timeout:g} s (data points so far: "
                     f"{self.pmu.get_data_count(self.channel)}, last KXCI error: {message}). If no output was "
-                    f"generated, check that 'Configure RPM' matches the hardware and the ranges are available; "
-                    f"otherwise increase 'Timeout in s'."
+                    f"generated, check the 'Trigger out' and 'Configure RPM' settings; otherwise increase 'Timeout "
+                    f"in s'."
                 )
-            if time.time() >= next_print:
-                print(f"SegArb: running ... {time.time() - start:.1f} s, data points: "
-                      f"{self.pmu.get_data_count(self.channel)}")
-                next_print = time.time() + 1.0
             time.sleep(poll_interval)
-
-        print(f"SegArb: finished after {time.time() - start:.2f} s, data points: "
-              f"{self.pmu.get_data_count(self.channel)}")
 
 
 if __name__ == "__main__":
