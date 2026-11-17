@@ -835,45 +835,11 @@ class WGFMUWidget(Widget):
         grid.addWidget(v_splitter, 0, 0)
         return grid
 
-    def get_setting(self) -> list[str]:
-        """Return a string representation of the current pulse definition csv file paths."""
-        csv_paths = []
-        for i in range(self.sequence_tabs.count()):
-            widget = self.sequence_tabs.widget(i)
-            if isinstance(widget, WGFMUTableWidget):
-                csv_paths.append(f"sequence_{i+1}: {widget.csv_path}")  # use 1-based indexing for user-readable format
+    # get_setting() / set_setting() are inherited from the base Widget. The CSV
+    # path round-trip is hardware-agnostic — it relies only on the common table
+    # API (csv_path + load_csv), which WGFMUTableWidget overrides for its
+    # combined-section CSV — so no WGFMU-specific override is needed here.
 
-        # add the waveform table csv path if it exists
-        if self.waveform_table and hasattr(self.waveform_table, 'csv_path'):
-            csv_paths.append(f"waveform_table: {self.waveform_table.csv_path}")
-        return csv_paths
-
-    def set_setting(self, setting: list[str]) -> None:
-        """Parse the setting string to extract csv file paths and load them into the respective tables."""
-        for line in setting:
-            if line.startswith("sequence_"):
-                try:
-                    key, path = line.split(":", 1)
-                    idx = int(key.split("_")[1])
-                    path = path.strip()
-                    if path:
-                        # if the tab does not exist yet, add it
-                        while idx > self.sequence_tabs.sequence_count():
-                            self.sequence_tabs.add_sequence_tab()
-
-                        widget = self.sequence_tabs.widget(idx - 1)  # convert to 0-based index
-                        if isinstance(widget, WGFMUTableWidget):
-                            widget.load_csv(path)
-                except (IndexError, ValueError):
-                    continue
-            elif line.startswith("waveform_table:"):
-                try:
-                    _, path = line.split(":", 1)
-                    path = path.strip()
-                    if path:
-                        self.waveform_table.load_csv(path)
-                except ValueError:
-                    continue
 
 # ---------------------------------------------------------------------------
 # SweepMe! CustomFunction entry point
