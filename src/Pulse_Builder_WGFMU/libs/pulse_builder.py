@@ -1,5 +1,18 @@
 import csv
-from PySide6 import QtWidgets, QtGui, QtCore
+import sys
+
+# SweepMe! 1.6.1 and newer ship PySide6, SweepMe! 1.5.x ships PySide2. Use the binding the running SweepMe! has
+# already loaded; otherwise (e.g. standalone) the first one available. Scripts can import QtWidgets, QtGui and QtCore
+# from here to stay on the same binding.
+if "PySide2" in sys.modules and "PySide6" not in sys.modules:
+    from PySide2 import QtWidgets, QtGui, QtCore
+else:
+    try:
+        from PySide6 import QtWidgets, QtGui, QtCore
+    except ImportError:
+        from PySide2 import QtWidgets, QtGui, QtCore
+
+# backend_qtagg (matplotlib >= 3.5) uses whichever Qt binding is imported above
 from matplotlib import pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
@@ -121,6 +134,57 @@ class Widget(QtWidgets.QWidget):
     def _recompute_waveform(self):
         xs, ys = compute_waveform(self._sequences, self._waveform_entries)
         self.plot_widget.set_waveform(xs, ys)
+
+    # ------------------------------------------------------------------
+    # Settings persistence — round-trip the CSV path of every sequence
+    # tab and the waveform table through a SweepMe! setting file.
+    #
+    # This is hardware-agnostic: it only relies on the common table API
+    # (`csv_path` attribute + `load_csv(path)` method) and the public
+    # `sequence_count()` / `add_sequence_tab()` of the tab widget, so
+    # hardware-specific subclasses inherit it unchanged.
+    # ------------------------------------------------------------------
+
+    def get_setting(self) -> list[str]:
+        """Return the CSV file path of each sequence tab and the waveform table.
+
+        Format: ["sequence_1: <path>", ..., "waveform_table: <path>"].
+        Empty paths are kept so the slot positions stay stable.
+        """
+        csv_paths = []
+        for i in range(self.sequence_tabs.sequence_count()):
+            widget = self.sequence_tabs.widget(i)
+            csv_paths.append(f"sequence_{i + 1}: {getattr(widget, 'csv_path', '')}")
+        csv_paths.append(f"waveform_table: {getattr(self.waveform_table, 'csv_path', '')}")
+        return csv_paths
+
+    def set_setting(self, setting: list[str]) -> None:
+        """Reload the CSV paths produced by get_setting().
+
+        Missing sequence tabs are created on demand; empty paths are skipped.
+        """
+        for line in setting:
+            if line.startswith("sequence_"):
+                try:
+                    key, path = line.split(":", 1)
+                    idx = int(key.split("_")[1])
+                    path = path.strip()
+                    if path:
+                        # Create sequence tabs on demand until the index exists
+                        while idx > self.sequence_tabs.sequence_count():
+                            self.sequence_tabs.add_sequence_tab()
+                        widget = self.sequence_tabs.widget(idx - 1)  # convert to 0-based
+                        widget.load_csv(path)
+                except (IndexError, ValueError):
+                    continue
+            elif line.startswith("waveform_table:"):
+                try:
+                    _, path = line.split(":", 1)
+                    path = path.strip()
+                    if path:
+                        self.waveform_table.load_csv(path)
+                except ValueError:
+                    continue
 
 
 # ---------------------------------------------------------------------------
@@ -555,9 +619,9 @@ class TableWidget(QtWidgets.QWidget):
         if not path:
             return
 
-        self.load_from_csv(path)
+        self.load_csv(path)
 
-    def load_from_csv(self, path) -> None:
+    def load_csv(self, path) -> None:
         """Load sequence data from a CSV file at the given path, replacing the table contents."""
         try:
             rows = []
@@ -613,7 +677,7 @@ class WaveformTableWidget(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        self._n_sequences = 0  # updated externally via updatesequence_count()
+        self._n_sequences = 0  # updated externally via update_sequence_count()
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
